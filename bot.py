@@ -235,6 +235,17 @@ def tip_in_text(tip: str, user_text: str) -> bool:
     return len(phrase) > 3 and phrase in norm_text(user_text)
 
 
+def tip_same_sides(tip: str) -> bool:
+    """Drop pointless tips like 'to the shop → to the shop'."""
+    for arrow in ("→", "->", "=>"):
+        if arrow in tip:
+            left, right = tip.split(arrow, 1)
+            left = norm_text(left.split(":")[-1])
+            right = norm_text(right)
+            return bool(left) and left == right
+    return False
+
+
 CASUAL_ADVERB_VERBS = re.compile(
     r"\b(go|goes|going|feel|feels|feeling|look|looks|looking|sound|sounds|taste|tastes|smell|smells)\b",
     re.I)
@@ -348,7 +359,8 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True) -> dict:
 
     if result is None:
         raise AIError(last_code)
-    result["tips"] = [t for t in result.get("tips", []) if not tip_in_text(t, user_text)]
+    result["tips"] = [t for t in result.get("tips", [])
+                      if not tip_in_text(t, user_text) and not tip_same_sides(t)]
 
     if save_user_text:
         u["history"].append({"role": "user", "content": user_text})
