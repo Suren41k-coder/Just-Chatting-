@@ -1455,6 +1455,10 @@ async def on_shutdown(bot: Bot):
         await pool.close()
 
 
+async def health(request):
+    return web.Response(text="OK")
+    
+    
 def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
