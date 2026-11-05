@@ -23,7 +23,7 @@ W, H = 720, 1280
 FPS = 24
 MIN_SECONDS = 3
 FLAME_WIDTH = 560
-FLAME_CENTER_Y = 500
+FLAME_CENTER_Y = 360
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(HERE, "assets")
@@ -184,10 +184,10 @@ def _text_layer(n: int) -> Image.Image:
     draw = ImageDraw.Draw(layer)
 
     digits = len(str(n))
-    size = {1: 520, 2: 440, 3: 340}.get(digits, 260)
+    size = {1: 420, 2: 380, 3: 300}.get(digits, 260)
     num_font = _font(size)
 
-    cx, cy = W // 2, FLAME_CENTER_Y + 40
+    cx, cy = W // 2, 860
     draw.text(
         (cx + 6, cy + 10), str(n), font=num_font,
         fill=(90, 10, 20, 90), anchor="mm",
@@ -198,8 +198,8 @@ def _text_layer(n: int) -> Image.Image:
     )
 
     label = "day in a row" if n == 1 else "days in a row"
-    label_font = _font(78)
-    ly = int(H * 0.70)
+    label_font = _font(52)
+    ly = 1090
 
     draw.text(
         (cx + 3, ly + 4), label, font=label_font,
