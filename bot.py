@@ -33,8 +33,8 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-                           Message, WebAppInfo)
+from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message, WebAppInfo)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 import story
@@ -77,6 +77,16 @@ TIMEZONES = [
      ("🇺🇸 New York", "America/New_York")],
 ]
 MORNING_TIMES = [["07:00", "08:00", "09:00"], ["10:00", "11:00", "12:00"]]
+
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+GEMINI_TTS_LEGACY_MODEL = os.environ.get("GEMINI_TTS_LEGACY_MODEL", "gemini-3.1-flash-tts-preview")
+STATS_KEEP_DAYS = 200
+GOAL_REPORT_HOUR = 21  # local hour of the final goal report on the last day
+NUDGE_TICK_SECONDS = 30
+GEMINI_VOICES = ["Kore", "Puck", "Charon", "Aoede"]
+EDGE_VOICES = ["en-US-AvaNeural", "en-US-AndrewNeural", "en-US-AriaNeural", "en-US-GuyNeural"]
+VOICE_SAMPLE = "Hey, it's good to hear from you. So, what did you get up to today?"
+VOICE_MODE_LABELS = {"off": "off", "button": "button", "always": "always"}
 
 # ---- chat styles: key -> (button label, instruction for the AI) ----
 FILLER_TEXT = (
@@ -191,6 +201,12 @@ USER_DEFAULTS = {
     "streak": 0, "best_streak": 0, "last_day": None, "prev_streak": 0, "prev_last_day": None,
     "blocked_day": None, "today_date": None, "today_count": 0, "last_morning": None,
     "pinned_msg_id": None, "history": [], "active": False, "awaiting": None,
+    # stage 4
+    "hints_on": True, "hint_min": 5, "hint_sent": False, "hint_ts": None, "silence_end": False,
+    "last_user_ts": None, "last_bot_ts": None, "remind_on": True, "remind1_h": 2, "remind2_h": 24,
+    "remind_sent": 0, "remind_ts": None, "quiet_from": "23:00", "quiet_to": "09:00",
+    "voice_mode": "off", "tts_voice": "gemini:Kore", "weak_on": True, "last_weak": None,
+    "stats": {}, "goals": [], "pending_goal": None, "last_hint": None, "last_hint_ts": None,
 }
 COLUMN_TYPES = {
     "level": "text", "topic": "text", "style": "text", "explain_lang": "text", "tz": "text",
@@ -199,6 +215,12 @@ COLUMN_TYPES = {
     "last_day": "date", "prev_streak": "integer", "prev_last_day": "date", "blocked_day": "date",
     "today_date": "date", "today_count": "integer", "last_morning": "date",
     "pinned_msg_id": "bigint", "history": "jsonb", "active": "boolean", "awaiting": "text",
+    "hints_on": "boolean", "hint_min": "integer", "hint_sent": "boolean", "hint_ts": "double precision",
+    "silence_end": "boolean", "last_user_ts": "double precision", "last_bot_ts": "double precision",
+    "remind_on": "boolean", "remind1_h": "integer", "remind2_h": "integer", "remind_sent": "integer",
+    "remind_ts": "double precision", "quiet_from": "text", "quiet_to": "text", "voice_mode": "text",
+    "tts_voice": "text", "weak_on": "boolean", "last_weak": "date", "stats": "jsonb", "goals": "jsonb",
+    "pending_goal": "jsonb", "last_hint": "text", "last_hint_ts": "double precision",
 }
 
 
@@ -240,7 +262,7 @@ def merge_row(uid: int, row: dict | None) -> dict:
     for key, default in USER_DEFAULTS.items():
         value = row.get(key) if row else None
         if value is None:
-            value = list(default) if isinstance(default, list) else default
+            value = list(default) if isinstance(default, list) else (dict(default) if isinstance(default, dict) else default)
         u[key] = value
     return u
 
@@ -356,7 +378,8 @@ def parse_hhmm(text: str) -> str | None:
 
 async def reset_chat(u: dict) -> None:
     # style and settings stay between conversations
-    await upd(u, level=None, topic=None, history=[], awaiting=None, active=False)
+    await upd(u, level=None, topic=None, history=[], awaiting=None, active=False,
+              hint_sent=False, silence_end=False, pending_goal=None)
 
 
 def build_prompt(u: dict) -> str:
@@ -697,7 +720,8 @@ async def send_ai_result(message: Message, u: dict, result: dict) -> None:
     reply = html.escape(result["reply"])
     if not mistakes and u["emoji"]:
         reply += " " + random.choice(PRAISE)
-    await message.answer(reply)
+    markup = kb([[("🔊 Listen", "tts:go")]]) if u["voice_mode"] == "button" else None
+    await message.answer(reply, reply_markup=markup)
 
     if mistakes:
         blocks = []
@@ -714,16 +738,19 @@ async def send_ai_result(message: Message, u: dict, result: dict) -> None:
     tips = result.get("tips") or []
     if tips and u["tips_on"]:
         await message.answer("\n".join(f"💡 <i>{html.escape(t)}</i>" for t in tips))
+    await upd(u, last_bot_ts=time.time(), hint_sent=False)
+    if u["voice_mode"] == "always":
+        track(send_voice_reply(message.bot, u, message.chat.id, result["reply"]))
 
 
-async def safe_ai(message: Message, u: dict, text: str, save_user_text: bool = True) -> bool:
+async def safe_ai(message: Message, u: dict, text: str, save_user_text: bool = True):
     try:
         result = await ask_ai(u, text, save_user_text)
     except AIError as e:
         await message.answer(f"Something went wrong (error {e.code}). Try again in a minute.")
-        return False
+        return None
     await send_ai_result(message, u, result)
-    return True
+    return result
 
 
 # ---- streak ----
@@ -845,6 +872,10 @@ async def morning_one(bot: Bot, u: dict) -> None:
         text = f"Day {u['streak']}{fire(u)} Ready to chat?"
     else:
         text = "New day! Ready to chat?"
+    note = weak_note(u)
+    if note:
+        text += "\n" + note
+        await upd(u, last_weak=today)
     await bot.send_message(u["user_id"], text, reply_markup=streak_kb(0, counted=False))
 
 
@@ -859,6 +890,698 @@ async def morning_loop(bot: Bot) -> None:
         except Exception:
             log.exception("morning loop error")
         await asyncio.sleep(60)
+
+
+# =====================================================================
+# stage 4: stats, weak spots, goals, hints, reminders, voice replies
+# =====================================================================
+CATEGORY_NAMES = {"a": "articles", "t": "tenses", "p": "prepositions", "w": "word order",
+                  "v": "verb forms", "s": "spelling", "c": "word choice", "o": "other"}
+
+
+def categorize(text) -> str:
+    t = str(text).lower()
+    if re.search(r"(не хватает|лишн|missing|extra|нужен|нужна)\s+(артикл\w*|a|an|the)\b", t) or "артикл" in t or "article" in t:
+        return "a"
+    for code, keys in (("s", ("написани", "орфограф", "опечат", "spelling", "typo")),
+                       ("p", ("предлог", "preposition")),
+                       ("w", ("порядок слов", "word order")),
+                       ("t", ("врем", "tense", "present perfect", "past simple", "future")),
+                       ("v", ("форм", "глагол", "verb", "agreement", "согласован")),
+                       ("c", ("слово", "словоупотреб", "word choice", "естественн", "natural"))):
+        if any(k in t for k in keys):
+            return code
+    return "o"
+
+
+# ---- generic "ask the AI for JSON" helper (used by goals, hints, nudges) ----
+def ai_providers():
+    out = []
+    if GEMINI_API_KEY:
+        out.append(("gemini", call_gemini))
+    if GROQ_API_KEY:
+        out.append(("groq", call_groq))
+    return out
+
+
+def loads_loose(text: str):
+    text = re.sub(r"^```(?:json)?|```$", "", str(text).strip(), flags=re.M).strip()
+    return json.loads(text)
+
+
+async def ai_json(system: str, user_text: str, history: list | None = None):
+    history = history or []
+    for name, fn in ai_providers():
+        for attempt in range(AI_ATTEMPTS):
+            try:
+                return loads_loose(await fn(system, history, user_text))
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+                log.error("%s json call failed: %s %s", name, code, e.response.text[:300])
+                if code not in RETRY_STATUSES or (code == 400 and name == "gemini"):
+                    break
+            except Exception:
+                log.exception("%s json call failed", name)
+            if attempt < AI_ATTEMPTS - 1:
+                await asyncio.sleep(1.5)
+    return None
+
+
+async def all_users() -> list[dict]:
+    if pool is None:
+        return list(mem_users.values())
+    try:
+        rows = await pool.fetch("SELECT * FROM users")
+        return [merge_row(r["user_id"], dict(r)) for r in rows]
+    except Exception:
+        log.exception("all_users failed")
+        return []
+
+
+# ---- statistics ----
+def day_key(u: dict) -> str:
+    return local_today(u).isoformat()
+
+
+async def record_stats(u: dict, result: dict, voice: bool) -> None:
+    stats = dict(u.get("stats") or {})
+    d = dict(stats.get(day_key(u)) or {"m": 0, "v": 0, "c": 0, "e": 0, "t": 0, "k": {}})
+    d["m"] += 1
+    if voice:
+        d["v"] += 1
+    mistakes = result.get("mistakes") or []
+    tips = result.get("tips") or []
+    if not mistakes:
+        d["c"] += 1
+    d["e"] += len(mistakes)
+    d["t"] += len(tips)
+    k = dict(d.get("k") or {})
+    for m in mistakes:
+        c = categorize(m.get("explanation", ""))
+        k[c] = k.get(c, 0) + 1
+    for t in tips:
+        c = categorize(t)
+        k[c] = k.get(c, 0) + 1
+    d["k"] = k
+    stats[day_key(u)] = d
+    if len(stats) > STATS_KEEP_DAYS:
+        for old in sorted(stats)[:-STATS_KEEP_DAYS]:
+            del stats[old]
+    await upd(u, stats=stats)
+
+
+def period_sum(stats: dict, end: date, n: int) -> dict:
+    out = {"m": 0, "days": 0, "c": 0, "e": 0}
+    for i in range(n):
+        d = stats.get((end - timedelta(days=i)).isoformat())
+        if d and d.get("m", 0) > 0:
+            out["m"] += d["m"]
+            out["c"] += d.get("c", 0)
+            out["e"] += d.get("e", 0)
+            out["days"] += 1
+    return out
+
+
+def top_categories(stats: dict, end: date, n: int) -> list[tuple[str, int]]:
+    total: dict[str, int] = {}
+    for i in range(n):
+        d = stats.get((end - timedelta(days=i)).isoformat())
+        for code, cnt in ((d or {}).get("k") or {}).items():
+            total[code] = total.get(code, 0) + cnt
+    return sorted(total.items(), key=lambda kv: -kv[1])
+
+
+def weak_note(u: dict) -> str | None:
+    if not u["weak_on"]:
+        return None
+    today = local_today(u)
+    if u["last_weak"] is not None and (today - u["last_weak"]).days < 3:
+        return None
+    top = [(c, n) for c, n in top_categories(u["stats"], today, 14) if c != "o" and n >= 3]
+    if not top:
+        return None
+    code, n = top[0]
+    return f"Lately your most common slip: {CATEGORY_NAMES[code]} ({n} times). Keep an eye on it today."
+
+
+# ---- goals ----
+def item_attempts(it: dict) -> int:
+    return it["c"] + it["w"]
+
+
+def item_pct(it: dict):
+    att = item_attempts(it)
+    if att == 0:
+        return None
+    acc = it["c"] / att
+    return round(100 * min(1, it["c"] / 3) * min(1, len(it["days"]) / 2) * acc)
+
+
+def item_status(it: dict) -> str:
+    att = item_attempts(it)
+    if att == 0:
+        return "unused"
+    acc = it["c"] / att
+    if it["c"] >= 3 and len(it["days"]) >= 2 and acc >= 0.8:
+        return "mastered"
+    if att >= 2 and acc < 0.5:
+        return "hard"
+    return "progress"
+
+
+def goal_overall(g: dict):
+    pcts = [p for p in (item_pct(i) for i in g["items"]) if p is not None]
+    return round(sum(pcts) / len(pcts)) if pcts else None
+
+
+def active_goals(u: dict) -> list[dict]:
+    return [g for g in u.get("goals") or [] if not g.get("done")]
+
+
+def goal_progress_line(u: dict, g: dict) -> str:
+    today = local_today(u)
+    start = date.fromisoformat(g["start"])
+    end = date.fromisoformat(g["end"])
+    total = (end - start).days + 1
+    day_n = min(max((today - start).days + 1, 1), total)
+    ov = goal_overall(g)
+    used = sum(1 for i in g["items"] if item_attempts(i) > 0)
+    return (f"🎯 {g['name']}: {'no data yet' if ov is None else str(ov) + '%'} "
+            f"(day {day_n} of {total}, used {used} of {len(g['items'])} items)")
+
+
+def goal_report(g: dict) -> list[str]:
+    ov = goal_overall(g)
+    used = [i for i in g["items"] if item_attempts(i) > 0]
+    groups = {"mastered": [], "progress": [], "hard": [], "unused": []}
+    for it in g["items"]:
+        groups[item_status(it)].append(it)
+
+    def line(it):
+        p = item_pct(it)
+        base = f"• {it['t']}"
+        if p is None:
+            return html.escape(base + (f" (only mentioned {it['m']}x)" if it["m"] else ""))
+        txt = html.escape(f"{base}: {p}% ({it['c']} right, {it['w']} wrong)")
+        if it["ex"]:
+            txt += f"\n   <i>{html.escape(it['ex'][-1])}</i>"
+        return txt
+
+    head = (f"🎯 <b>Goal report: {html.escape(g['name'])}</b>\n{g['start']} to {g['end']}\n"
+            f"Overall: {'not enough data' if ov is None else str(ov) + '%'} "
+            f"(used {len(used)} of {len(g['items'])} items)\n"
+            "Only your own uses count. Mentions and uses right after my hint do not.")
+    parts = [head]
+    titles = (("mastered", "✅ Mastered"), ("progress", "📈 In progress"),
+              ("hard", "⚠️ Needs work"), ("unused", "⏳ Not used yet (this does not mean you do not know it)"))
+    for key, title in titles:
+        if groups[key]:
+            body = "\n".join(line(i) for i in groups[key])
+            parts.append(f"<b>{title} ({len(groups[key])})</b>\n{body}")
+    prompted = sum(i["p"] for i in g["items"])
+    if prompted:
+        parts.append(f"Uses after my hints (not counted): {prompted}")
+    # split into messages under the Telegram limit, only between lines (tags stay balanced)
+    msgs, cur = [], ""
+    for ln in "\n\n".join(parts).split("\n"):
+        if len(cur) + len(ln) + 1 > 3800 and cur:
+            msgs.append(cur)
+            cur = ln
+        else:
+            cur = f"{cur}\n{ln}" if cur else ln
+    msgs.append(cur)
+    return msgs
+
+
+STOP_WORDS = {"to", "a", "an", "the", "sb", "sth", "smb", "something", "somebody", "someone", "one's", "your"}
+
+
+def stem(w: str) -> str:
+    w = w.lower()
+    for suf in ("ing", "ed", "es", "s", "ly"):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            return w[: -len(suf)]
+    return w
+
+
+def lex_in(item: str, text: str) -> bool:
+    words = [stem(w) for w in re.findall(r"[A-Za-z']+", item) if w.lower() not in STOP_WORDS]
+    toks = [stem(w) for w in re.findall(r"[A-Za-z']+", text)]
+    if not words or not toks:
+        return False
+    return all(any(t.startswith(w) or w.startswith(t) for t in toks if len(t) >= 2) for w in words)
+
+
+ASSESS_PROMPT = (
+    "You are a strict language-learning assessor. A learner chats in English with a friendly partner. "
+    "You get the learner's latest message, the partner's previous message and a list of study items. "
+    "For each item that appears in the learner's message in any form (any tense or inflection, a phrasal "
+    "verb with words in between, a grammar construction actually used), decide the outcome:\n"
+    '- "correct": the learner used it on their own, naturally and correctly in context (form AND meaning).\n'
+    '- "wrong": the learner clearly tried to use it but got that item wrong (form, meaning or construction).\n'
+    '- "mentioned": the item is only quoted, asked about, defined, translated or listed, not used to say '
+    "something of their own.\n"
+    "Leave out items that are absent. Do not guess: when unsure, leave the item out.\n"
+    '"prompted" is true if the partner\'s previous message or the shown hint contained the same item, or the '
+    "learner echoes or closely follows the partner's wording or the hint, otherwise false.\n"
+    '"example" is the learner\'s own phrase with the item (max 120 characters).\n'
+    'Return ONLY JSON: {"results":[{"id":number,"outcome":"correct|wrong|mentioned","prompted":boolean,'
+    '"example":string}]}'
+)
+
+
+def last_assistant(u: dict) -> str:
+    for m in reversed(u.get("history") or []):
+        if m.get("role") == "assistant":
+            return m.get("content", "")
+    return ""
+
+
+async def track_goals(uid: int, text: str, prev_bot: str) -> None:
+    try:
+        u = await get_user(uid)
+        today = local_today(u).isoformat()
+        goals = [g for g in active_goals(u) if g["start"] <= today <= g["end"]]
+        if not goals or len(text.split()) < 2:
+            return
+        flat = [(g["id"], it["id"], it["t"], it["k"]) for g in goals for it in g["items"]]
+        hint = u.get("last_hint") or ""
+        if time.time() - (u.get("last_hint_ts") or 0) > 900:
+            hint = ""  # an old hint is no longer in the learner's head
+        payload = {"learner_message": text[:600], "partner_previous_message": prev_bot[:600],
+                   "hint_shown_to_learner": hint[:300],
+                   "items": [{"id": i, "item": t, "kind": k} for i, (_, _, t, k) in enumerate(flat)]}
+        data = await ai_json(ASSESS_PROMPT, json.dumps(payload, ensure_ascii=False))
+        if not data or not isinstance(data.get("results"), list):
+            return
+        fresh = await get_user(uid)  # the goals may have changed while the AI was thinking
+        h = hashlib.md5(norm_text(text).encode()).hexdigest()[:10]
+        changed = False
+        for r in data["results"]:
+            try:
+                gid, iid, item_text, _kind = flat[int(r["id"])]
+            except Exception:
+                continue
+            outcome = r.get("outcome")
+            if outcome not in ("correct", "wrong", "mentioned"):
+                continue
+            g = next((x for x in fresh["goals"] if x["id"] == gid and not x.get("done")), None)
+            it = next((x for x in (g or {}).get("items", []) if x["id"] == iid), None)
+            if it is None or h in it["seen"]:
+                continue  # the same message is never counted twice
+            prompted = bool(r.get("prompted")) or lex_in(item_text, prev_bot) or (bool(hint) and lex_in(item_text, hint))
+            example = str(r.get("example") or "")[:120]
+            if prompted:
+                it["p"] += 1
+            elif outcome == "correct":
+                it["c"] += 1
+                if today not in it["days"]:
+                    it["days"].append(today)
+                if example:
+                    it["ex"] = (it["ex"] + [example])[-3:]
+            elif outcome == "wrong":
+                it["w"] += 1
+                if example:
+                    it["ex"] = (it["ex"] + ["(wrong) " + example])[-3:]
+            else:
+                it["m"] += 1
+            it["seen"] = (it["seen"] + [h])[-200:]
+            changed = True
+        if changed:
+            await upd(fresh, goals=fresh["goals"])
+    except Exception:
+        log.exception("track_goals failed")
+
+
+GOAL_PARSE_PROMPT = (
+    "Extract study items from the learner's text. Items can be words, expressions, phrasal verbs, grammar "
+    "constructions or tenses, or anything else they want to practice. Return ONLY JSON: "
+    '{"items":[{"t":string,"k":"word|phrase|phrasal|grammar|other"}]}. '
+    "Keep each item short, in English (for grammar use a short name like 'Present Perfect'). "
+    "Merge duplicates, at most 40 items."
+)
+
+
+def fallback_items(text: str) -> list[dict]:
+    parts = [p.strip(" -•*\t") for p in re.split(r"[\n;,]+", text) if p.strip(" -•*\t")]
+    return [{"t": p[:60], "k": "phrase"} for p in parts[:40]]
+
+
+def new_goal(u: dict, items: list[dict], days: int) -> dict:
+    today = local_today(u)
+    gid = max([g["id"] for g in (u.get("goals") or [])] + [0]) + 1
+    return {"id": gid, "name": f"Goal #{gid}", "start": today.isoformat(),
+            "end": (today + timedelta(days=days - 1)).isoformat(), "done": False,
+            "items": [{"id": i + 1, "t": it["t"], "k": it.get("k", "other"), "c": 0, "w": 0, "m": 0,
+                       "p": 0, "days": [], "ex": [], "seen": []} for i, it in enumerate(items)]}
+
+
+# ---- stats text and widget ----
+def build_stats(u: dict) -> dict:
+    today = local_today(u)
+    stats = u["stats"]
+    days = [stats.get((today - timedelta(days=i)).isoformat(), {}).get("m", 0) for i in range(89, -1, -1)]
+    w1 = period_sum(stats, today, 7)
+    w0 = period_sum(stats, today - timedelta(days=7), 7)
+    clean_now = round(100 * w1["c"] / w1["m"]) if w1["m"] else None
+    clean_prev = round(100 * w0["c"] / w0["m"]) if w0["m"] else None
+    return {
+        "today": today, "days": days, "w1": w1, "w0": w0, "clean_now": clean_now, "clean_prev": clean_prev,
+        "total_days": sum(1 for v in stats.values() if v.get("m", 0) > 0),
+        "total_msgs": sum(v.get("m", 0) for v in stats.values()),
+        "total_voice": sum(v.get("v", 0) for v in stats.values()),
+        "top": [(c, n) for c, n in top_categories(stats, today, 30) if c != "o"][:3],
+    }
+
+
+def stats_text(u: dict, s: dict) -> str:
+    lines = ["📊 Your progress",
+             f"🔥 Streak: {u['streak']} (best {u['best_streak']})",
+             f"📅 Days practiced: {s['total_days']}, messages: {s['total_msgs']}, voice: {s['total_voice']}",
+             f"This week: {s['w1']['m']} messages, {s['w1']['days']} active days "
+             f"(last week: {s['w0']['m']} messages, {s['w0']['days']} days)"]
+    if s["clean_now"] is not None:
+        extra = ""
+        if s["clean_prev"] is not None:
+            diff = s["clean_now"] - s["clean_prev"]
+            extra = f" (last week {s['clean_prev']}%, {'+' if diff >= 0 else ''}{diff})"
+        lines.append(f"✨ Messages without mistakes: {s['clean_now']}%{extra}")
+    if s["top"]:
+        lines.append("Most common slips (30 days): " +
+                     ", ".join(f"{CATEGORY_NAMES[c]} {n}" for c, n in s["top"]))
+    for g in active_goals(u):
+        lines.append(goal_progress_line(u, g))
+    return "\n".join(lines)
+
+
+def widget_payload(u: dict, s: dict) -> str:
+    data = {"e": s["today"].isoformat(), "d": s["days"][-90:], "s": u["streak"], "b": u["best_streak"],
+            "t": s["total_days"], "w": s["clean_now"] if s["clean_now"] is not None else -1,
+            "p": s["clean_prev"] if s["clean_prev"] is not None else -1,
+            "k": [[c, n] for c, n in s["top"]],
+            "g": [[g["name"][:14], goal_overall(g) if goal_overall(g) is not None else -1]
+                  for g in active_goals(u)][:2]}
+    text = json.dumps(data, separators=(",", ":"))
+    while len(text.encode()) > 1000 and len(data["d"]) > 14:
+        data["d"] = data["d"][len(data["d"]) // 4:]
+        if len(text.encode()) > 1000 and data["g"]:
+            data["g"] = data["g"][:1]
+        text = json.dumps(data, separators=(",", ":"))
+    return text
+
+
+STATS_WIDGET_HTML = """<style>
+body{margin:0;padding:10px 12px 12px}
+h4{margin:0}
+.s{color:var(--tg-theme-hint-color);font-size:12px;min-height:15px;margin:2px 0 6px}
+.b{display:flex;align-items:flex-end;height:96px;gap:1px;border-bottom:1px solid var(--tg-theme-section-separator-color)}
+.b i{flex:1;background:var(--tg-theme-button-color);border-radius:2px 2px 0 0}
+.t{display:flex;gap:6px;margin:8px 0}
+.t button{flex:1;padding:5px 0;font-size:13px;border-radius:8px;border:0;background:var(--tg-theme-secondary-bg-color);color:var(--tg-theme-text-color)}
+.t .on{background:var(--tg-theme-button-color);color:var(--tg-theme-button-text-color)}
+.g{display:flex;text-align:center}
+.g div{flex:1}
+.g b{display:block;font-size:20px}
+.g span,.k{color:var(--tg-theme-hint-color);font-size:12px}
+.k{margin-top:6px}
+</style>
+<h4>Practice activity</h4><div class=s id=s></div><div class=b id=b></div>
+<div class=t id=t></div><div class=g id=g></div><div class=k id=k></div>
+<script>
+var W=window.TelegramWidget,D={};
+try{D=JSON.parse(W.publicData)}catch(e){}
+var all=D.d||[],n=30,a=[];
+var N={a:"articles",t:"tenses",p:"prepositions",w:"word order",v:"verb forms",s:"spelling",c:"word choice"};
+function $(i){return document.getElementById(i)}
+function dt(i){if(!D.e)return"?";var d=new Date(D.e+"T00:00:00Z");d.setUTCDate(d.getUTCDate()-(a.length-1-i));return d.toISOString().slice(0,10)}
+function draw(){
+a=all.slice(-n);var mx=Math.max.apply(null,a.concat([1])),h="",i;
+for(i=0;i<a.length;i++)h+='<i data-i="'+i+'" style="height:'+Math.max(1,Math.round(a[i]/mx*92))+'px"></i>';
+$("b").innerHTML=h;
+var sum=0;for(i=0;i<a.length;i++)sum+=a[i];
+$("s").textContent="Last "+a.length+" days: "+sum+" messages";
+var t="";[7,30,90].forEach(function(v){t+='<button data-n="'+v+'"'+(v==n?' class=on':'')+'>'+v+'d</button>'});
+$("t").innerHTML=t}
+$("b").onclick=function(e){var i=e.target.getAttribute?e.target.getAttribute("data-i"):null;if(i!==null)$("s").textContent=dt(+i)+": "+a[+i]+" messages"};
+$("t").onclick=function(e){var v=e.target.getAttribute?e.target.getAttribute("data-n"):null;if(v){n=+v;draw()}};
+var c=D.w<0?"-":D.w+"%",d=D.w>=0&&D.p>=0?(D.w-D.p>=0?"+":"")+(D.w-D.p):"";
+$("g").innerHTML="<div><b>"+(D.s||0)+"</b><span>streak</span></div><div><b>"+(D.t||0)+"</b><span>days</span></div><div><b>"+c+"</b><span>clean "+d+"</span></div>";
+var k="",j;(D.k||[]).forEach(function(x){k+=(k?", ":"")+N[x[0]]+" "+x[1]});
+(D.g||[]).forEach(function(x){k+=(k?"<br>":"")+x[0]+": "+(x[1]<0?"no data":x[1]+"%")});
+$("k").innerHTML=(k?"Slips: ":"")+k;
+draw();
+</script>"""
+
+
+async def send_widget(chat_id: int, html_text: str, caption: str, public_data: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendWidget",
+                                  json={"chat_id": chat_id, "html": html_text,
+                                        "caption": caption[:1000], "public_data": public_data})
+        data = r.json()
+        if not data.get("ok"):
+            log.warning("sendWidget refused: %s", str(data)[:300])
+            return False
+        return True
+    except Exception:
+        log.exception("sendWidget failed")
+        return False
+
+
+# ---- hints and reminders ----
+HINT_PROMPT = (
+    "You help an English learner who went silent in a chat. Suggest 3 short, natural things they could say "
+    "next to continue the conversation. They must fit the last messages, the topic and the level "
+    "({level}). Return ONLY JSON: {{\"hints\":[{{\"en\":string,\"ru\":string}}]}} where ru is a short "
+    "Russian translation."
+)
+
+
+async def gen_hint(u: dict) -> str | None:
+    level = LEVELS.get(u["level"], "unknown")
+    data = await ai_json(HINT_PROMPT.format(level=level), "Suggest what I could say next.",
+                         (u.get("history") or [])[-6:])
+    hints = (data or {}).get("hints") if isinstance(data, dict) else None
+    if not hints:
+        return None
+    lines = []
+    for h in hints[:3]:
+        if isinstance(h, dict) and h.get("en"):
+            ru = f" ({h['ru']})" if h.get("ru") else ""
+            lines.append(f"• {html.escape(str(h['en']))}{html.escape(ru)}")
+    if not lines:
+        return None
+    await upd(u, last_hint=" ".join(str(h.get("en", "")) for h in hints[:3] if isinstance(h, dict)),
+              last_hint_ts=time.time())
+    return "💡 You could say:\n" + "\n".join(lines)
+
+
+STATIC_NUDGES = ["Hey, up for a quick chat in English?", "Got a minute? Let's practice a bit.",
+                 "Hey, how's your day going? Tell me about it in English."]
+
+
+async def gen_nudge(u: dict) -> str:
+    system = (build_prompt(u) + "\nNow write ONE short message (1-2 sentences) that invites the learner to come "
+              'back and chat, in your style, mentioning the last topic of the chat if there is one. '
+              'Return ONLY JSON: {"reply":"...","mistakes":[],"tips":[]}.')
+    data = await ai_json(system, "Write the nudge now.", (u.get("history") or [])[-6:])
+    if isinstance(data, dict) and data.get("reply"):
+        try:
+            return clean_reply(data["reply"])
+        except Exception:
+            pass
+    return random.choice(STATIC_NUDGES)
+
+
+def in_quiet_hours(u: dict, now: datetime) -> bool:
+    a, b = parse_hhmm(u.get("quiet_from") or ""), parse_hhmm(u.get("quiet_to") or "")
+    if not a or not b or a == b:
+        return False
+    t = now.strftime("%H:%M")
+    return (t >= a or t < b) if a > b else (a <= t < b)
+
+
+async def nudge_one(bot: Bot, u: dict) -> None:
+    now_ts = time.time()
+    uid = u["user_id"]
+    last_user, last_bot = u.get("last_user_ts"), u.get("last_bot_ts")
+    waiting = bool(last_bot) and (last_user is None or last_user < last_bot)
+
+    # 1) hint when he stops answering in an active conversation, then end the conversation
+    if u["active"] and u["hints_on"] and waiting:
+        wait = u["hint_min"] * 60
+        if not u["hint_sent"] and now_ts - last_bot >= wait:
+            text = await gen_hint(u)
+            await upd(u, hint_sent=True, hint_ts=now_ts)
+            if text:
+                await bot.send_message(uid, text)
+            return
+        if u["hint_sent"] and now_ts - (u.get("hint_ts") or now_ts) >= wait:
+            await upd(u, active=False, silence_end=True, hint_sent=False)
+            return
+
+    # 2) reminders after a longer silence
+    if u["remind_on"] and last_user:
+        limit = 1 if u["remind2_h"] == 0 else 2
+        sent = u["remind_sent"]
+        if sent < limit:
+            threshold = u["remind1_h"] * 3600 if sent == 0 else u["remind2_h"] * 3600
+            gap_ok = sent == 0 or now_ts - (u.get("remind_ts") or 0) >= 3600
+            now_local = local_now(u)
+            counted = u["streak_on"] and u["last_day"] == now_local.date()
+            if (now_ts - last_user >= threshold and gap_ok and not counted
+                    and not in_quiet_hours(u, now_local)):
+                await upd(u, remind_sent=sent + 1, remind_ts=now_ts)
+                await bot.send_message(uid, html.escape(await gen_nudge(u)))
+                return
+
+    # 3) goal reports on the last day of a goal (or later, if the bot was off)
+    now_local = local_now(u)
+    for g in active_goals(u):
+        end = date.fromisoformat(g["end"])
+        if now_local.date() > end or (now_local.date() == end and now_local.hour >= GOAL_REPORT_HOUR):
+            for part in goal_report(g):
+                await bot.send_message(uid, part)
+            g["done"] = True
+            for it in g["items"]:
+                it["seen"] = []
+            done = [x for x in u["goals"] if x.get("done")]
+            keep = [x for x in u["goals"] if not x.get("done")] + done[-3:]
+            await upd(u, goals=keep)
+            return
+
+
+async def nudge_loop(bot: Bot) -> None:
+    while True:
+        try:
+            for u in await all_users():
+                try:
+                    await nudge_one(bot, u)
+                except Exception:
+                    log.exception("nudge failed for %s", u.get("user_id"))
+        except Exception:
+            log.exception("nudge loop error")
+        await asyncio.sleep(NUDGE_TICK_SECONDS)
+
+
+async def mark_user_message(u: dict) -> None:
+    await upd(u, last_user_ts=time.time(), hint_sent=False, remind_sent=0)
+
+
+async def ensure_active(message: Message, u: dict) -> bool:
+    if u["active"]:
+        return True
+    if u["silence_end"] or u["remind_sent"] > 0:  # he is back after a pause: just continue
+        await upd(u, active=True, silence_end=False)
+        return True
+    await message.answer("Send /start to begin 🙂")
+    return False
+
+
+async def after_user_message(bot: Bot, u: dict, text: str, result: dict, voice: bool, prev_bot: str) -> None:
+    await record_stats(u, result, voice)
+    track(track_goals(u["user_id"], text, prev_bot))
+
+
+# ---- voice replies (text to speech) ----
+def to_ogg_opus(data: bytes, mime: str) -> bytes:
+    import subprocess
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        import shutil
+        exe = shutil.which("ffmpeg")
+    if not exe:
+        raise RuntimeError("ffmpeg not found")
+    in_args = ["-i", "pipe:0"]
+    if "l16" in mime.lower() or "pcm" in mime.lower():
+        m = re.search(r"rate=(\d+)", mime)
+        in_args = ["-f", "s16le", "-ar", m.group(1) if m else "24000", "-ac", "1", "-i", "pipe:0"]
+    cmd = [exe, "-hide_banner", "-loglevel", "error", "-y", *in_args, "-c:a", "libopus", "-b:a", "32k",
+           "-ar", "48000", "-ac", "1", "-f", "ogg", "pipe:1"]
+    r = subprocess.run(cmd, input=data, capture_output=True, timeout=90)
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError("ffmpeg failed: " + r.stderr.decode(errors="ignore")[:200])
+    return r.stdout
+
+
+async def tts_gemini(text: str, voice: str) -> tuple[bytes, str]:
+    style = "relaxed, friendly, natural American accent, conversational pace"
+    variants = [
+        (GEMINI_TTS_MODEL, {
+            "contents": [{"role": "user", "parts": [{"text": text, "speech_metadata": {"style": style}}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"voice": voice}}}}),
+        (GEMINI_TTS_LEGACY_MODEL, {
+            "contents": [{"parts": [{"text": f"Say in a {style}: {text}"}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}}),
+    ]
+    last_error: Exception = RuntimeError("no variants")
+    for model, payload in variants:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(GEMINI_URL.format(model=model),
+                                      headers={"x-goog-api-key": GEMINI_API_KEY}, json=payload)
+            r.raise_for_status()
+            part = r.json()["candidates"][0]["content"]["parts"][0]["inlineData"]
+            return base64.b64decode(part["data"]), part.get("mimeType", "audio/L16;rate=24000")
+        except Exception as e:
+            last_error = e
+            log.warning("Gemini TTS variant %s failed: %s", model, str(e)[:200])
+    raise last_error
+
+
+async def tts_edge(text: str, voice: str) -> tuple[bytes, str]:
+    import edge_tts
+    audio = b""
+    async for chunk in edge_tts.Communicate(text, voice).stream():
+        if chunk["type"] == "audio":
+            audio += chunk["data"]
+    if not audio:
+        raise RuntimeError("Edge TTS returned no audio")
+    return audio, "audio/mpeg"
+
+
+def clean_for_speech(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text)
+    return " ".join(text.split())[:700]
+
+
+async def synth(text: str, u: dict) -> bytes:
+    text = clean_for_speech(text)
+    if not text:
+        raise RuntimeError("nothing to say")
+    provider, _, voice = (u.get("tts_voice") or "gemini:Kore").partition(":")
+    order = [(provider, voice)]
+    other = "edge" if provider == "gemini" else "gemini"
+    order.append((other, EDGE_VOICES[0] if other == "edge" else GEMINI_VOICES[0]))
+    last_error: Exception = RuntimeError("no voice provider")
+    for prov, vc in order:
+        try:
+            if prov == "gemini" and GEMINI_API_KEY:
+                data, mime = await tts_gemini(text, vc)
+            elif prov == "edge":
+                data, mime = await tts_edge(text, vc)
+            else:
+                continue
+            return await asyncio.to_thread(to_ogg_opus, data, mime)
+        except Exception as e:
+            last_error = e
+            log.warning("TTS provider %s failed: %s", prov, str(e)[:200])
+    raise last_error
+
+
+async def send_voice_reply(bot: Bot, u: dict, chat_id: int, text: str) -> None:
+    try:
+        await bot.send_chat_action(chat_id, "record_voice")
+        ogg = await synth(text, u)
+        await bot.send_voice(chat_id, BufferedInputFile(ogg, filename="reply.ogg"))
+    except Exception:
+        log.exception("voice reply failed")
 
 
 # ---- keyboards ----
@@ -905,6 +1628,11 @@ def settings_kb(u: dict):
         [(f"🎭 Style: {style_label}", "set:style")],
         [(f"🕒 Time zone: {tz_label(u['tz'])}", "set:tz")],
         [(f"⏰ Morning time: {u['morning_time']}", "set:time")],
+        [(f"{mark(u['hints_on'])} Silence hints", "set:hints"), (f"{mark(u['weak_on'])} Weak spots", "set:weak")],
+        [(f"💡 Hint after: {u['hint_min']} min", "set:hmin")],
+        [(f"{mark(u['remind_on'])} Reminders", "set:remind"), ("🔔 Reminder timing", "set:rm")],
+        [(f"🔊 Voice replies: {VOICE_MODE_LABELS.get(u['voice_mode'], 'off')}", "set:voice"),
+         ("🎙 Voice choice", "set:vchoice")],
     ])
 
 
@@ -955,6 +1683,9 @@ HELP_TEXT = (
     "/style - change the vibe\n"
     "/settings - emoji, tips, streak, time zone and more\n"
     "/streak - your streak\n"
+    "/stats - your progress\n"
+    "/setagoal - practice goals (words, grammar, phrasal verbs)\n"
+    "/hint - ideas for what to say next\n"
     "/help - this message"
 )
 ADMIN_HELP = (
@@ -962,7 +1693,8 @@ ADMIN_HELP = (
     "/allow ID - give someone access\n"
     "/deny ID - take access away\n"
     "/allowed - list of allowed IDs\n"
-    "/setstreak N - set the streak to N days (today counts)"
+    "/setstreak N - set the streak to N days (today counts)\n"
+    "/voicetest - send voice samples to choose a voice"
 )
 
 
@@ -1120,13 +1852,24 @@ async def cb_set(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     key = call.data.split(":", 1)[1]
     toggles = {"emoji": "emoji", "tips": "tips_on", "streak": "streak_on",
-               "morning": "morning_on", "pin": "pin_on"}
+               "morning": "morning_on", "pin": "pin_on", "hints": "hints_on", "weak": "weak_on",
+               "remind": "remind_on"}
     await call.answer()
     if key in toggles:
         field = toggles[key]
         await upd(u, **{field: not u[field]})
     elif key == "lang":
         await upd(u, explain_lang="en" if u["explain_lang"] == "ru" else "ru")
+    elif key == "hmin":
+        await upd(u, hint_min={3: 5, 5: 10, 10: 3}.get(u["hint_min"], 5))
+    elif key == "voice":
+        await upd(u, voice_mode={"off": "button", "button": "always", "always": "off"}.get(u["voice_mode"], "off"))
+    elif key == "vchoice":
+        await call.message.answer("Pick a voice (or send /voicetest to hear them):", reply_markup=voice_kb())
+        return
+    elif key == "rm":
+        await call.message.answer("🔔 " + reminder_summary(u), reply_markup=reminder_kb())
+        return
     elif key == "style":
         await call.message.answer("Pick the vibe of our chat:", reply_markup=style_kb())
         return
@@ -1224,12 +1967,12 @@ async def on_voice(message: Message):
     if u["awaiting"]:
         await message.answer("Please type that as text 👇")
         return
-    if not u["active"]:
-        await message.answer("Send /start to begin 🙂")
+    if not await ensure_active(message, u):
         return
     if message.voice.duration > MAX_VOICE_SECONDS:
         await message.answer("Please keep voice messages under 60 seconds 🎙️")
         return
+    await mark_user_message(u)
     try:
         buf = BytesIO()
         await message.bot.download(message.voice, destination=buf)
@@ -1245,8 +1988,11 @@ async def on_voice(message: Message):
         await message.answer("I couldn't hear anything. Try again? 🎙️")
         return
     await message.answer(f"🎙 <i>{html.escape(text)}</i>")
-    if await safe_ai(message, u, text):
+    prev_bot = last_assistant(u)
+    result = await safe_ai(message, u, text)
+    if result:
         await register_message(message.bot, u)
+        await after_user_message(message.bot, u, text, result, True, prev_bot)
 
 
 @router.message(F.text & ~F.text.startswith("/"))
@@ -1259,6 +2005,16 @@ async def on_text(message: Message):
     if awaiting == "topic":
         await upd(u, topic=message.text.strip()[:100])
         await begin_chat(message, u)
+        return
+    if awaiting == "goal_text":
+        await handle_goal_text(message, u)
+        return
+    if awaiting == "goal_days":
+        digits = message.text.strip()
+        if digits.isdigit() and 1 <= int(digits) <= 365:
+            await create_goal(message, u, int(digits))
+        else:
+            await message.answer("Please type a number of days from 1 to 365.")
         return
     if awaiting == "tz":
         name = parse_tz(message.text)
@@ -1276,11 +2032,14 @@ async def on_text(message: Message):
         else:
             await message.answer("Please type the time like 09:30.")
         return
-    if not u["active"]:
-        await message.answer("Send /start to begin 🙂")
+    if not await ensure_active(message, u):
         return
-    if await safe_ai(message, u, message.text):
+    await mark_user_message(u)
+    prev_bot = last_assistant(u)
+    result = await safe_ai(message, u, message.text)
+    if result:
         await register_message(message.bot, u)
+        await after_user_message(message.bot, u, message.text, result, False, prev_bot)
 
 
 @router.message(F.sticker | F.photo | F.video | F.animation | F.document | F.video_note | F.audio)
@@ -1293,6 +2052,182 @@ async def on_media(message: Message):
     note = (f"[The user sent a {kind}. React to it in English like it is a meme or a funny situation, "
             "keep it short, and at the end say you can't see or read it. Return an empty list for mistakes.]")
     await safe_ai(message, u, note, save_user_text=False)
+
+
+# ---- stage 4 handlers: hints, stats, goals, reminders menu, voice ----
+QUIET_OPTIONS = [("22:00-08:00", "22:00", "08:00"), ("23:00-09:00", "23:00", "09:00"),
+                 ("00:00-10:00", "00:00", "10:00"), ("Off", "00:00", "00:00")]
+GOAL_ASK_TEXT = ("Send me what you want to practice: words, expressions, phrasal verbs, grammar, anything. "
+                 "One message, any format. I will not push these words into our chat, I will just notice "
+                 "when you use them on your own.")
+
+
+@router.message(Command("hint"))
+async def cmd_hint(message: Message):
+    u = await get_user(message.from_user.id)
+    if not u["active"]:
+        await message.answer("Start a conversation first: /start")
+        return
+    text = await gen_hint(u)
+    await message.answer(text or "I could not think of a hint right now. Try again in a minute.")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    u = await get_user(message.from_user.id)
+    s = build_stats(u)
+    text = stats_text(u, s)
+    if not await send_widget(message.chat.id, STATS_WIDGET_HTML, text, widget_payload(u, s)):
+        await message.answer(text)
+
+
+@router.message(Command("setagoal", ignore_case=True))
+async def cmd_setagoal(message: Message):
+    u = await get_user(message.from_user.id)
+    goals = active_goals(u)
+    if not goals:
+        await upd(u, awaiting="goal_text")
+        await message.answer(GOAL_ASK_TEXT)
+        return
+    rows = [[("➕ New goal", "ga:new")]] + [[(f"🗑 Delete {g['name']}", f"ga:del:{g['id']}")] for g in goals]
+    await message.answer("Your goals:\n" + "\n".join(goal_progress_line(u, g) for g in goals),
+                         reply_markup=kb(rows))
+
+
+@router.callback_query(F.data.startswith("ga:"))
+async def cb_goal_menu(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    parts = call.data.split(":")
+    await call.answer()
+    if parts[1] == "new":
+        await upd(u, awaiting="goal_text")
+        await call.message.answer(GOAL_ASK_TEXT)
+    elif parts[1] == "del" and len(parts) == 3 and parts[2].isdigit():
+        gid = int(parts[2])
+        await upd(u, goals=[g for g in u["goals"] if g["id"] != gid])
+        await call.message.answer("Goal deleted.")
+
+
+async def handle_goal_text(message: Message, u: dict) -> None:
+    await message.answer("Reading your list...")
+    data = await ai_json(GOAL_PARSE_PROMPT, message.text[:2000])
+    items: list[dict] = []
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        for it in data["items"][:40]:
+            if isinstance(it, dict) and str(it.get("t", "")).strip():
+                items.append({"t": str(it["t"]).strip()[:60], "k": str(it.get("k", "other"))[:10]})
+    if not items:
+        items = fallback_items(message.text)
+    if not items:
+        await message.answer("I could not find anything there. Send the words separated by commas.")
+        return
+    await upd(u, pending_goal={"items": items}, awaiting=None)
+    text = (f"I found {len(items)} items:\n" + "\n".join(f"• {html.escape(i['t'])}" for i in items) +
+            "\n\nFor how long should I track them?")
+    await message.answer(text, reply_markup=kb([[("7 days", "gd:7"), ("14 days", "gd:14"), ("30 days", "gd:30")],
+                                                [("✍️ Custom", "gd:custom"), ("✖ Cancel", "gd:cancel")]]))
+
+
+async def create_goal(message: Message, u: dict, days: int) -> None:
+    pending = u.get("pending_goal")
+    if not pending or not pending.get("items"):
+        await message.answer("There is nothing to create. Start again with /setagoal.")
+        return
+    goal = new_goal(u, pending["items"], days)
+    await upd(u, goals=(u.get("goals") or []) + [goal], pending_goal=None, awaiting=None)
+    await message.answer(f"Done: {goal['name']} for {days} days ({len(goal['items'])} items), until {goal['end']}. "
+                         f"I will just watch how you use them. The report comes on the last day at "
+                         f"{GOAL_REPORT_HOUR}:00.")
+
+
+@router.callback_query(F.data.startswith("gd:"))
+async def cb_goal_days(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    value = call.data.split(":", 1)[1]
+    await call.answer()
+    if value == "cancel":
+        await upd(u, pending_goal=None, awaiting=None)
+        await call.message.answer("Cancelled.")
+    elif value == "custom":
+        await upd(u, awaiting="goal_days")
+        await call.message.answer("How many days? Type a number from 1 to 365.")
+    elif value.isdigit():
+        await create_goal(call.message, u, int(value))
+
+
+# ---- reminder timing menu ----
+def reminder_summary(u: dict) -> str:
+    second = "off" if u["remind2_h"] == 0 else f"{u['remind2_h']}h"
+    quiet = "off" if u["quiet_from"] == u["quiet_to"] else f"{u['quiet_from']}-{u['quiet_to']}"
+    return f"First reminder after {u['remind1_h']}h, second after {second}, quiet hours: {quiet}."
+
+
+def reminder_kb():
+    return kb([[("1h", "rm1:1"), ("2h", "rm1:2"), ("3h", "rm1:3"), ("5h", "rm1:5")],
+               [("2nd: 12h", "rm2:12"), ("2nd: 24h", "rm2:24"), ("2nd: off", "rm2:0")],
+               [(f"🌙 {label}", f"rmq:{i}") for i, (label, _a, _b) in enumerate(QUIET_OPTIONS)]])
+
+
+@router.callback_query(F.data.startswith("rm1:") | F.data.startswith("rm2:") | F.data.startswith("rmq:"))
+async def cb_reminder_timing(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    kind, value = call.data.split(":", 1)
+    await call.answer()
+    if kind == "rm1" and value.isdigit():
+        await upd(u, remind1_h=int(value))
+    elif kind == "rm2" and value.isdigit():
+        await upd(u, remind2_h=int(value))
+    elif kind == "rmq" and value.isdigit() and int(value) < len(QUIET_OPTIONS):
+        _label, a, b = QUIET_OPTIONS[int(value)]
+        await upd(u, quiet_from=a, quiet_to=b)
+    try:
+        await call.message.edit_text("🔔 " + reminder_summary(u), reply_markup=reminder_kb())
+    except Exception:
+        pass
+
+
+# ---- voice replies ----
+def voice_kb():
+    rows = [[(f"Gemini {v}", f"vc:gemini:{v}") for v in GEMINI_VOICES[i:i + 2]] for i in range(0, len(GEMINI_VOICES), 2)]
+    rows += [[(v.replace("en-US-", "").replace("Neural", " (Edge)"), f"vc:edge:{v}") for v in EDGE_VOICES[i:i + 2]]
+             for i in range(0, len(EDGE_VOICES), 2)]
+    return kb(rows)
+
+
+@router.callback_query(F.data.startswith("vc:"))
+async def cb_voice_choice(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    _, provider, voice = call.data.split(":", 2)
+    await call.answer()
+    if (provider == "gemini" and voice in GEMINI_VOICES) or (provider == "edge" and voice in EDGE_VOICES):
+        await upd(u, tts_voice=f"{provider}:{voice}")
+        await call.message.answer(f"Voice set: {voice} ({provider}). Try /voicetest or turn on voice replies in /settings.")
+
+
+@router.callback_query(F.data == "tts:go")
+async def cb_tts(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    await call.answer("Recording...")
+    await send_voice_reply(call.bot, u, call.from_user.id, call.message.text or "")
+
+
+@router.message(Command("voicetest"))
+async def cmd_voicetest(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("Sending voice samples one by one, it can take a minute...")
+    tests = ([("gemini", v) for v in GEMINI_VOICES] if GEMINI_API_KEY else []) + [("edge", v) for v in EDGE_VOICES]
+    for provider, voice in tests:
+        try:
+            data, mime = await (tts_gemini if provider == "gemini" else tts_edge)(VOICE_SAMPLE, voice)
+            ogg = await asyncio.to_thread(to_ogg_opus, data, mime)
+            await message.bot.send_voice(message.chat.id, BufferedInputFile(ogg, filename="sample.ogg"),
+                                         caption=f"{provider}: {voice}")
+        except Exception as e:
+            log.warning("voicetest %s %s failed: %s", provider, voice, str(e)[:200])
+            await message.answer(f"{provider}: {voice} failed ({str(e)[:80]})")
+    await message.answer("Pick one in /settings → Voice choice.")
+
 
 
 # ---- web server (webhook, health check for the pinger, story page) ----
@@ -1448,6 +2383,7 @@ async def on_startup(bot: Bot):
                               drop_pending_updates=True)
         log.info("Webhook set")
     track(morning_loop(bot))
+    track(nudge_loop(bot))
 
 
 async def on_shutdown(bot: Bot):

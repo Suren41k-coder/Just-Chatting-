@@ -4,3 +4,4 @@ asyncpg>=0.29
 Pillow>=10.1
 imageio-ffmpeg>=0.5
 tzdata
+edge-tts>=6.1
