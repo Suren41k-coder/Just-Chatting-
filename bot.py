@@ -33,6 +33,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
+from aiogram.utils.chat_action import ChatActionSender
 from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message, WebAppInfo)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -717,11 +718,15 @@ async def transcribe(audio: bytes) -> str:
 # ---- sending answers ----
 async def send_ai_result(message: Message, u: dict, result: dict) -> None:
     mistakes = result["mistakes"][:5]
-    reply = html.escape(result["reply"])
-    if not mistakes and u["emoji"]:
-        reply += " " + random.choice(PRAISE)
-    markup = kb([[("🔊 Listen", "tts:go")]]) if u["voice_mode"] == "button" else None
-    await message.answer(reply, reply_markup=markup)
+    voice_sent = False
+    if u["voice_mode"] == "always":
+        voice_sent = await send_voice_reply(message.bot, u, message.chat.id, result["reply"])
+    if not voice_sent:  # text goes out unless the voice reply was sent (or voice failed)
+        reply = html.escape(result["reply"])
+        if not mistakes and u["emoji"]:
+            reply += " " + random.choice(PRAISE)
+        markup = kb([[("🔊 Listen", "tts:go")]]) if u["voice_mode"] == "button" else None
+        await message.answer(reply, reply_markup=markup)
 
     if mistakes:
         blocks = []
@@ -739,13 +744,13 @@ async def send_ai_result(message: Message, u: dict, result: dict) -> None:
     if tips and u["tips_on"]:
         await message.answer("\n".join(f"💡 <i>{html.escape(t)}</i>" for t in tips))
     await upd(u, last_bot_ts=time.time(), hint_sent=False)
-    if u["voice_mode"] == "always":
-        track(send_voice_reply(message.bot, u, message.chat.id, result["reply"]))
 
 
 async def safe_ai(message: Message, u: dict, text: str, save_user_text: bool = True):
+    sender = ChatActionSender.record_voice if u["voice_mode"] == "always" else ChatActionSender.typing
     try:
-        result = await ask_ai(u, text, save_user_text)
+        async with sender(bot=message.bot, chat_id=message.chat.id):
+            result = await ask_ai(u, text, save_user_text)
     except AIError as e:
         await message.answer(f"Something went wrong (error {e.code}). Try again in a minute.")
         return None
@@ -1575,13 +1580,15 @@ async def synth(text: str, u: dict) -> bytes:
     raise last_error
 
 
-async def send_voice_reply(bot: Bot, u: dict, chat_id: int, text: str) -> None:
+async def send_voice_reply(bot: Bot, u: dict, chat_id: int, text: str) -> bool:
     try:
-        await bot.send_chat_action(chat_id, "record_voice")
-        ogg = await synth(text, u)
-        await bot.send_voice(chat_id, BufferedInputFile(ogg, filename="reply.ogg"))
+        async with ChatActionSender.record_voice(bot=bot, chat_id=chat_id):
+            ogg = await synth(text, u)
+            await bot.send_voice(chat_id, BufferedInputFile(ogg, filename="reply.ogg"))
+        return True
     except Exception:
         log.exception("voice reply failed")
+        return False
 
 
 # ---- keyboards ----
@@ -2207,7 +2214,7 @@ async def cb_voice_choice(call: CallbackQuery):
 @router.callback_query(F.data == "tts:go")
 async def cb_tts(call: CallbackQuery):
     u = await get_user(call.from_user.id)
-    await call.answer("Recording...")
+    await call.answer()
     await send_voice_reply(call.bot, u, call.from_user.id, call.message.text or "")
 
 
