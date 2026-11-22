@@ -33,7 +33,6 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.utils.chat_action import ChatActionSender
 from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message, WebAppInfo)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -135,6 +134,10 @@ STYLES = {
     ),
 }
 DEFAULT_STYLE = "friend"
+FRIEND_STYLE = (
+    "Your personality is described above. Let it show in how you write, but keep replies natural, "
+    "never over-the-top, and never turn into a caricature."
+)
 
 HUMAN_RULES = (
     "Write like a real person in a chat, not like an assistant. Rules:\n"
@@ -208,6 +211,7 @@ USER_DEFAULTS = {
     "remind_sent": 0, "remind_ts": None, "quiet_from": "23:00", "quiet_to": "09:00",
     "voice_mode": "off", "tts_voice": "gemini:Kore", "weak_on": True, "last_weak": None,
     "stats": {}, "goals": [], "pending_goal": None, "last_hint": None, "last_hint_ts": None,
+    "pending_friend": None,
 }
 COLUMN_TYPES = {
     "level": "text", "topic": "text", "style": "text", "explain_lang": "text", "tz": "text",
@@ -222,6 +226,7 @@ COLUMN_TYPES = {
     "remind_ts": "double precision", "quiet_from": "text", "quiet_to": "text", "voice_mode": "text",
     "tts_voice": "text", "weak_on": "boolean", "last_weak": "date", "stats": "jsonb", "goals": "jsonb",
     "pending_goal": "jsonb", "last_hint": "text", "last_hint_ts": "double precision",
+    "pending_friend": "jsonb",
 }
 
 
@@ -230,6 +235,120 @@ def track(coro) -> None:
     task = asyncio.create_task(coro)
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
+
+
+# ---- topics and friends ----
+class Typing:
+    """Keeps a chat action (typing / record_voice) alive in a chat or topic while the block runs."""
+
+    def __init__(self, bot, chat_id: int, action: str = "typing", thread_id: int | None = None):
+        self.bot, self.chat_id, self.action, self.thread_id = bot, chat_id, action, thread_id
+        self.task = None
+
+    async def _loop(self) -> None:
+        kw = {"message_thread_id": self.thread_id} if self.thread_id else {}
+        while True:
+            try:
+                await self.bot.send_chat_action(self.chat_id, self.action, **kw)
+            except Exception:
+                pass
+            await asyncio.sleep(4.5)  # Telegram shows an action for about 5 seconds
+
+    async def __aenter__(self):
+        self.task = asyncio.create_task(self._loop())
+        return self
+
+    async def __aexit__(self, *exc):
+        self.task.cancel()
+        try:
+            await self.task
+        except asyncio.CancelledError:
+            pass
+        return False
+
+
+def thread_of(message) -> int | None:
+    return getattr(message, "message_thread_id", None)
+
+
+async def say(message, text: str, thread_id: int | None = None, **kw):
+    """Sends text to the chat of `message`, into the same topic (or the given one)."""
+    tid = thread_id if thread_id is not None else thread_of(message)
+    if tid:
+        kw["message_thread_id"] = tid
+    return await message.bot.send_message(message.chat.id, text, **kw)
+
+
+mem_friends: dict[int, dict] = {}  # used when there is no database
+mem_friend_seq = 0
+
+
+def friend_row(row) -> dict:
+    f = dict(row)
+    f["history"] = f.get("history") or []
+    return f
+
+
+async def friends_of(uid: int) -> list[dict]:
+    if pool is not None:
+        try:
+            rows = await pool.fetch("SELECT * FROM friends WHERE user_id = $1 ORDER BY id", uid)
+            return [friend_row(r) for r in rows]
+        except Exception:
+            log.exception("friends_of failed")
+    return [f for f in mem_friends.values() if f["user_id"] == uid]
+
+
+async def friend_by_thread(uid: int, thread_id: int | None) -> dict | None:
+    if not thread_id:
+        return None
+    for f in await friends_of(uid):
+        if f["thread_id"] == thread_id:
+            return f
+    return None
+
+
+async def friend_here(message) -> dict | None:
+    return await friend_by_thread(message.from_user.id, thread_of(message))
+
+
+async def add_friend(uid: int, name: str, about: str, voice: str, accent: str | None, thread_id: int) -> dict:
+    global mem_friend_seq
+    if pool is not None:
+        try:
+            row = await pool.fetchrow(
+                "INSERT INTO friends (user_id, name, about, voice, accent, thread_id, history) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
+                uid, name, about, voice, accent, thread_id, [])
+            return friend_row(row)
+        except Exception:
+            log.exception("add_friend failed")
+    mem_friend_seq += 1
+    f = {"id": mem_friend_seq, "user_id": uid, "name": name, "about": about, "voice": voice,
+         "accent": accent, "thread_id": thread_id, "history": [], "mem": True}
+    mem_friends[f["id"]] = f
+    return f
+
+
+async def upd_friend(f: dict, **fields) -> None:
+    f.update(fields)
+    if pool is None or f.get("mem") or not fields:
+        return
+    names = list(fields)
+    sets = ", ".join(f"{name} = ${i + 2}" for i, name in enumerate(names))
+    try:
+        await pool.execute(f"UPDATE friends SET {sets} WHERE id = $1", f["id"], *[fields[n] for n in names])
+    except Exception:
+        log.exception("upd_friend failed")
+
+
+async def del_friend(f: dict) -> None:
+    mem_friends.pop(f["id"], None)
+    if pool is not None and not f.get("mem"):
+        try:
+            await pool.execute("DELETE FROM friends WHERE id = $1", f["id"])
+        except Exception:
+            log.exception("del_friend failed")
 
 
 async def init_db() -> None:
@@ -250,6 +369,14 @@ async def init_db() -> None:
             for col, typ in COLUMN_TYPES.items():
                 await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {typ}")
             await conn.execute("CREATE TABLE IF NOT EXISTS allowed (user_id bigint PRIMARY KEY)")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS friends (id bigserial PRIMARY KEY, user_id bigint, name text, "
+                "about text, voice text, accent text, thread_id bigint, history jsonb DEFAULT '[]'::jsonb)")
+            for table in ("users", "allowed", "friends"):  # keep the Supabase API closed for every table
+                try:
+                    await conn.execute(f"ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY")
+                except Exception:
+                    log.warning("could not enable RLS on %s", table)
             rows = await conn.fetch("SELECT user_id FROM allowed")
         allowed.update(r["user_id"] for r in rows)
         log.info("Database ready")
@@ -380,17 +507,25 @@ def parse_hhmm(text: str) -> str | None:
 async def reset_chat(u: dict) -> None:
     # style and settings stay between conversations
     await upd(u, level=None, topic=None, history=[], awaiting=None, active=False,
-              hint_sent=False, silence_end=False, pending_goal=None)
+              hint_sent=False, silence_end=False, pending_goal=None, pending_friend=None)
 
 
-def build_prompt(u: dict) -> str:
+def build_prompt(u: dict, friend: dict | None = None) -> str:
     level = LEVELS.get(u["level"]) if u["level"] else None
     explain_lang = "English" if u.get("explain_lang") == "en" else "Russian"
     style = STYLES.get(u.get("style"), STYLES[DEFAULT_STYLE])[1]
     topic = f"Topic to talk about: {u['topic']} (stay on it unless the user changes it)." if u["topic"] \
         else "Topic: free talk."
+    intro = 'You are "Just Chatting", a chat partner for English speaking practice in Telegram. '
+    if friend:
+        topic = "Topic: free talk."
+        style = FRIEND_STYLE
+        intro = (f"You are {friend['name']}, a person the learner chats with in Telegram to practice English. "
+                 f"Who you are and how you behave (written by the learner, may be in any language): "
+                 f"{friend['about']}\n"
+                 "Stay in this character in every reply: background, interests, humor and way of speaking. ")
     return (
-        'You are "Just Chatting", a chat partner for English speaking practice in Telegram. '
+        intro +
         "Use American English (spelling and vocabulary), never British.\n"
         f"Learner level: {level or 'unknown, adapt to the person as the chat goes'}. {topic}\n"
         f"Style: {style}\n"
@@ -589,10 +724,13 @@ async def call_groq(system: str, history: list[dict], user_text: str) -> str:
     return r.json()["choices"][0]["message"]["content"]
 
 
-async def ask_ai(u: dict, user_text: str, save_user_text: bool = True) -> dict:
-    system = build_prompt(u)
-    history = u["history"][-HISTORY_LIMIT:]
-    style_text = STYLES.get(u.get("style"), STYLES[DEFAULT_STYLE])[1]
+async def ask_ai(u: dict, user_text: str, save_user_text: bool = True, friend: dict | None = None) -> dict:
+    system = build_prompt(u, friend)
+    history = (friend or u)["history"][-HISTORY_LIMIT:]
+    if friend:
+        style_text = f"Stay fully in character as {friend['name']}: {friend['about'][:300]}"
+    else:
+        style_text = STYLES.get(u.get("style"), STYLES[DEFAULT_STYLE])[1]
     # the reminder keeps the style strong even when earlier replies were written in another style
     final_user = f"{user_text}\n\n[Reply in this style (do not mention this note): {style_text}]"
 
@@ -644,7 +782,10 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True) -> dict:
     if save_user_text:
         new_history.append({"role": "user", "content": user_text})
     new_history.append({"role": "assistant", "content": result["reply"]})
-    await upd(u, history=new_history[-HISTORY_LIMIT:])
+    if friend:
+        await upd_friend(friend, history=new_history[-HISTORY_LIMIT:])
+    else:
+        await upd(u, history=new_history[-HISTORY_LIMIT:])
     return result
 
 
@@ -716,17 +857,19 @@ async def transcribe(audio: bytes) -> str:
 
 
 # ---- sending answers ----
-async def send_ai_result(message: Message, u: dict, result: dict) -> None:
+async def send_ai_result(message: Message, u: dict, result: dict, friend: dict | None = None,
+                         thread_id: int | None = None) -> None:
+    tid = thread_id if thread_id is not None else thread_of(message)
     mistakes = result["mistakes"][:5]
     voice_sent = False
     if u["voice_mode"] == "always":
-        voice_sent = await send_voice_reply(message.bot, u, message.chat.id, result["reply"])
+        voice_sent = await send_voice_reply(message.bot, u, message.chat.id, result["reply"], friend, tid)
     if not voice_sent:  # text goes out unless the voice reply was sent (or voice failed)
         reply = html.escape(result["reply"])
         if not mistakes and u["emoji"]:
             reply += " " + random.choice(PRAISE)
         markup = kb([[("🔊 Listen", "tts:go")]]) if u["voice_mode"] == "button" else None
-        await message.answer(reply, reply_markup=markup)
+        await say(message, reply, tid, reply_markup=markup)
 
     if mistakes:
         blocks = []
@@ -738,23 +881,25 @@ async def send_ai_result(message: Message, u: dict, result: dict) -> None:
             if examples:
                 block += "\n" + "\n".join(f"• {html.escape(str(x))}" for x in examples[:per_mistake])
             blocks.append(block)
-        await message.answer("\n\n".join(blocks))
+        await say(message, "\n\n".join(blocks), tid)
 
     tips = result.get("tips") or []
     if tips and u["tips_on"]:
-        await message.answer("\n".join(f"💡 <i>{html.escape(t)}</i>" for t in tips))
+        await say(message, "\n".join(f"💡 <i>{html.escape(t)}</i>" for t in tips), tid)
     await upd(u, last_bot_ts=time.time(), hint_sent=False)
 
 
-async def safe_ai(message: Message, u: dict, text: str, save_user_text: bool = True):
-    sender = ChatActionSender.record_voice if u["voice_mode"] == "always" else ChatActionSender.typing
+async def safe_ai(message: Message, u: dict, text: str, save_user_text: bool = True,
+                  friend: dict | None = None, thread_id: int | None = None):
+    tid = thread_id if thread_id is not None else thread_of(message)
+    action = "record_voice" if u["voice_mode"] == "always" else "typing"
     try:
-        async with sender(bot=message.bot, chat_id=message.chat.id):
-            result = await ask_ai(u, text, save_user_text)
+        async with Typing(message.bot, message.chat.id, action, tid):
+            result = await ask_ai(u, text, save_user_text, friend)
     except AIError as e:
-        await message.answer(f"Something went wrong (error {e.code}). Try again in a minute.")
+        await say(message, f"Something went wrong (error {e.code}). Try again in a minute.", tid)
         return None
-    await send_ai_result(message, u, result)
+    await send_ai_result(message, u, result, friend, tid)
     return result
 
 
@@ -1512,8 +1657,9 @@ def to_ogg_opus(data: bytes, mime: str) -> bytes:
     return r.stdout
 
 
-async def tts_gemini(text: str, voice: str) -> tuple[bytes, str]:
-    style = "relaxed, friendly, natural American accent, conversational pace"
+async def tts_gemini(text: str, voice: str, accent: str | None = None) -> tuple[bytes, str]:
+    style = (f"relaxed, friendly, speaking English with a strong {accent} accent, conversational pace" if accent
+             else "relaxed, friendly, natural American accent, conversational pace")
     variants = [
         (GEMINI_TTS_MODEL, {
             "contents": [{"role": "user", "parts": [{"text": text, "speech_metadata": {"style": style}}]}],
@@ -1556,11 +1702,12 @@ def clean_for_speech(text: str) -> str:
     return " ".join(text.split())[:700]
 
 
-async def synth(text: str, u: dict) -> bytes:
+async def synth(text: str, u: dict, friend: dict | None = None) -> bytes:
     text = clean_for_speech(text)
     if not text:
         raise RuntimeError("nothing to say")
-    provider, _, voice = (u.get("tts_voice") or "gemini:Kore").partition(":")
+    provider, _, voice = ((friend or {}).get("voice") or u.get("tts_voice") or "gemini:Kore").partition(":")
+    accent = (friend or {}).get("accent")
     order = [(provider, voice)]
     other = "edge" if provider == "gemini" else "gemini"
     order.append((other, EDGE_VOICES[0] if other == "edge" else GEMINI_VOICES[0]))
@@ -1568,7 +1715,7 @@ async def synth(text: str, u: dict) -> bytes:
     for prov, vc in order:
         try:
             if prov == "gemini" and GEMINI_API_KEY:
-                data, mime = await tts_gemini(text, vc)
+                data, mime = await tts_gemini(text, vc, accent)
             elif prov == "edge":
                 data, mime = await tts_edge(text, vc)
             else:
@@ -1580,11 +1727,13 @@ async def synth(text: str, u: dict) -> bytes:
     raise last_error
 
 
-async def send_voice_reply(bot: Bot, u: dict, chat_id: int, text: str) -> bool:
+async def send_voice_reply(bot: Bot, u: dict, chat_id: int, text: str, friend: dict | None = None,
+                           thread_id: int | None = None) -> bool:
     try:
-        async with ChatActionSender.record_voice(bot=bot, chat_id=chat_id):
-            ogg = await synth(text, u)
-            await bot.send_voice(chat_id, BufferedInputFile(ogg, filename="reply.ogg"))
+        async with Typing(bot, chat_id, "record_voice", thread_id):
+            ogg = await synth(text, u, friend)
+            kw = {"message_thread_id": thread_id} if thread_id else {}
+            await bot.send_voice(chat_id, BufferedInputFile(ogg, filename="reply.ogg"), **kw)
         return True
     except Exception:
         log.exception("voice reply failed")
@@ -1692,6 +1841,8 @@ HELP_TEXT = (
     "/streak - your streak\n"
     "/stats - your progress\n"
     "/setagoal - practice goals (words, grammar, phrasal verbs)\n"
+    "/create - make a friend with their own topic\n"
+    "/friends - your friends\n"
     "/hint - ideas for what to say next\n"
     "/help - this message"
 )
@@ -1708,6 +1859,11 @@ ADMIN_HELP = (
 @router.message(Command("start", "new"))
 async def cmd_start(message: Message):
     u = await get_user(message.from_user.id)
+    friend = await friend_here(message)
+    if friend:  # inside a friend's topic: just clear that conversation
+        await upd_friend(friend, history=[])
+        await say(message, "Fresh start 👋")
+        return
     await reset_chat(u)
     await message.answer(
         "Hey! 👋 I'm here to help you practice English. Just chat with me, "
@@ -1972,12 +2128,13 @@ async def on_voice(message: Message):
         return
     u = await get_user(uid)
     if u["awaiting"]:
-        await message.answer("Please type that as text 👇")
+        await say(message, "Please type that as text 👇")
         return
-    if not await ensure_active(message, u):
+    friend = await friend_here(message)
+    if not friend and not await ensure_active(message, u):
         return
     if message.voice.duration > MAX_VOICE_SECONDS:
-        await message.answer("Please keep voice messages under 60 seconds 🎙️")
+        await say(message, "Please keep voice messages under 60 seconds 🎙️")
         return
     await mark_user_message(u)
     try:
@@ -1985,18 +2142,18 @@ async def on_voice(message: Message):
         await message.bot.download(message.voice, destination=buf)
         text = await transcribe(buf.getvalue())
     except AIError as e:
-        await message.answer(f"Something went wrong (error {e.code}). Try again in a minute.")
+        await say(message, f"Something went wrong (error {e.code}). Try again in a minute.")
         return
     except Exception:
         log.exception("Voice download failed")
-        await message.answer("Something went wrong (error 500). Try again in a minute.")
+        await say(message, "Something went wrong (error 500). Try again in a minute.")
         return
     if not text:
-        await message.answer("I couldn't hear anything. Try again? 🎙️")
+        await say(message, "I couldn't hear anything. Try again? 🎙️")
         return
-    await message.answer(f"🎙 <i>{html.escape(text)}</i>")
-    prev_bot = last_assistant(u)
-    result = await safe_ai(message, u, text)
+    await say(message, f"🎙 <i>{html.escape(text)}</i>")
+    prev_bot = last_assistant(friend or u)
+    result = await safe_ai(message, u, text, friend=friend)
     if result:
         await register_message(message.bot, u)
         await after_user_message(message.bot, u, text, result, True, prev_bot)
@@ -2023,6 +2180,9 @@ async def on_text(message: Message):
         else:
             await message.answer("Please type a number of days from 1 to 365.")
         return
+    if awaiting in ("fr_name", "fr_about", "fr_accent"):
+        await friend_dialog_text(message, u, awaiting)
+        return
     if awaiting == "tz":
         name = parse_tz(message.text)
         if name:
@@ -2039,11 +2199,12 @@ async def on_text(message: Message):
         else:
             await message.answer("Please type the time like 09:30.")
         return
-    if not await ensure_active(message, u):
+    friend = await friend_here(message)
+    if not friend and not await ensure_active(message, u):
         return
     await mark_user_message(u)
-    prev_bot = last_assistant(u)
-    result = await safe_ai(message, u, message.text)
+    prev_bot = last_assistant(friend or u)
+    result = await safe_ai(message, u, message.text, friend=friend)
     if result:
         await register_message(message.bot, u)
         await after_user_message(message.bot, u, message.text, result, False, prev_bot)
@@ -2053,12 +2214,171 @@ async def on_text(message: Message):
 async def on_media(message: Message):
     uid = message.from_user.id
     u = await get_user(uid)
-    if not u["active"] or not cooldown_ok(uid):
+    friend = await friend_here(message)
+    if not (friend or u["active"]) or not cooldown_ok(uid):
         return
     kind = message.content_type.value
     note = (f"[The user sent a {kind}. React to it in English like it is a meme or a funny situation, "
             "keep it short, and at the end say you can't see or read it. Return an empty list for mistakes.]")
-    await safe_ai(message, u, note, save_user_text=False)
+    await safe_ai(message, u, note, save_user_text=False, friend=friend)
+
+
+# ---- friends: own characters in their own topics ----
+VOICE_GENDER = {"Kore": "♀", "Puck": "♂", "Charon": "♂", "Aoede": "♀",
+                "en-US-AvaNeural": "♀", "en-US-AndrewNeural": "♂", "en-US-AriaNeural": "♀", "en-US-GuyNeural": "♂"}
+GREET_NOTE = ("[The learner just opened this chat with you. Greet them in character in one or two short "
+              "sentences, like a friend who messages first. Return an empty list for mistakes.]")
+
+
+def friend_voice_kb():
+    items = ([(f"{v} {VOICE_GENDER.get(v, '')}".strip(), f"fv:gemini:{v}") for v in GEMINI_VOICES]
+             if GEMINI_API_KEY else [])
+    items += [(f"{v.replace('en-US-', '').replace('Neural', '')} {VOICE_GENDER.get(v, '')} (Edge)",
+               f"fv:edge:{v}") for v in EDGE_VOICES]
+    return kb([items[i:i + 2] for i in range(0, len(items), 2)])
+
+
+def accent_kb():
+    return kb([[("No accent", "fa:none")], [("Spanish", "fa:Spanish"), ("Indian", "fa:Indian")],
+               [("French", "fa:French"), ("✍️ Other", "fa:other")]])
+
+
+async def start_friend_create(message, u: dict) -> None:
+    await upd(u, awaiting="fr_name", pending_friend={})
+    await say(message, "Let's create a friend. What's their name?")
+
+
+async def friend_dialog_text(message: Message, u: dict, awaiting: str) -> None:
+    text = (message.text or "").strip()
+    pend = dict(u.get("pending_friend") or {})
+    if awaiting == "fr_name":
+        if not 1 <= len(text) <= 30:
+            await say(message, "Please send a name, up to 30 characters.")
+            return
+        pend["name"] = text
+        await upd(u, pending_friend=pend, awaiting="fr_about")
+        await say(message, f"Who is {html.escape(text)} and what are they like? Their character, how they talk, "
+                           "what they care about. Any words, any language.")
+    elif awaiting == "fr_about":
+        if len(text) < 3:
+            await say(message, "Tell me a bit more about them.")
+            return
+        pend["about"] = text[:600]
+        await upd(u, pending_friend=pend, awaiting=None)
+        await say(message, "Pick a voice. It is used when voice replies are on in /settings "
+                           "(/voicetest sends samples).", reply_markup=friend_voice_kb())
+    elif awaiting == "fr_accent":
+        pend["accent"] = text[:30] or None
+        await upd(u, pending_friend=pend, awaiting=None)
+        await finish_friend(message, u)
+
+
+async def finish_friend(message, u: dict) -> None:
+    pend = u.get("pending_friend") or {}
+    if not (pend.get("name") and pend.get("about") and pend.get("voice")):
+        await say(message, "Something is missing. Start again with /create.")
+        return
+    try:
+        topic = await message.bot.create_forum_topic(chat_id=message.chat.id, name=pend["name"][:30])
+    except Exception:
+        log.exception("create_forum_topic failed")
+        await say(message, "I couldn't create the topic. Open @BotFather, go to this bot's settings and turn on "
+                           "topics for private chats, then tap the button.",
+                  reply_markup=kb([[("Try again", "fc:go")]]))
+        return
+    friend = await add_friend(u["user_id"], pend["name"], pend["about"], pend["voice"],
+                              pend.get("accent"), topic.message_thread_id)
+    await upd(u, pending_friend=None, awaiting=None)
+    await say(message, f"✅ {html.escape(friend['name'])} is ready. Open the topic in the sidebar.")
+    await safe_ai(message, u, GREET_NOTE, save_user_text=False, friend=friend, thread_id=friend["thread_id"])
+
+
+@router.message(Command("create"))
+async def cmd_create(message: Message):
+    u = await get_user(message.from_user.id)
+    await start_friend_create(message, u)
+
+
+@router.message(Command("friends"))
+async def cmd_friends(message: Message):
+    fs = await friends_of(message.from_user.id)
+    if fs:
+        text = "Your friends:\n" + "\n".join(
+            f"• {html.escape(f['name'])}: {html.escape(f['about'][:60])}" for f in fs) + "\n\nTap 🗑 to delete one."
+    else:
+        text = "You have no friends yet. Tap the button or send /create."
+    rows = [[("➕ New friend", "fr:new")]] + [[(f"🗑 {f['name']}", f"fr:del:{f['id']}")] for f in fs]
+    await say(message, text, reply_markup=kb(rows))
+
+
+@router.callback_query(F.data.startswith("fr:"))
+async def cb_friends(call: CallbackQuery):
+    uid = call.from_user.id
+    u = await get_user(uid)
+    await call.answer()
+    parts = call.data.split(":")
+    if parts[1] == "new":
+        await start_friend_create(call.message, u)
+        return
+    if parts[1] == "no":
+        await say(call.message, "Cancelled.")
+        return
+    if len(parts) < 3 or not parts[2].isdigit():
+        return
+    friend = next((f for f in await friends_of(uid) if f["id"] == int(parts[2])), None)
+    if not friend:
+        await say(call.message, "I can't find that friend.")
+    elif parts[1] == "del":
+        await say(call.message, f"Delete {html.escape(friend['name'])} and the whole conversation?",
+                  reply_markup=kb([[("Yes, delete", f"fr:yes:{friend['id']}"), ("Cancel", "fr:no")]]))
+    elif parts[1] == "yes":
+        try:
+            await call.bot.delete_forum_topic(chat_id=call.message.chat.id, message_thread_id=friend["thread_id"])
+        except Exception:
+            log.warning("could not delete the topic of %s", friend["name"])
+        await del_friend(friend)
+        await say(call.message, "Deleted.")
+
+
+@router.callback_query(F.data.startswith("fv:"))
+async def cb_friend_voice(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    await call.answer()
+    pend = dict(u.get("pending_friend") or {})
+    _, provider, voice = call.data.split(":", 2)
+    if not pend.get("about") or not ((provider == "gemini" and voice in GEMINI_VOICES)
+                                     or (provider == "edge" and voice in EDGE_VOICES)):
+        return
+    pend["voice"] = f"{provider}:{voice}"
+    await upd(u, pending_friend=pend)
+    if provider == "gemini":  # only Gemini voices can have an accent
+        await say(call.message, "Should their English have an accent? (voice only)", reply_markup=accent_kb())
+    else:
+        await finish_friend(call.message, u)
+
+
+@router.callback_query(F.data.startswith("fa:"))
+async def cb_friend_accent(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    await call.answer()
+    pend = dict(u.get("pending_friend") or {})
+    if not pend.get("voice"):
+        return
+    key = call.data.split(":", 1)[1]
+    if key == "other":
+        await upd(u, awaiting="fr_accent")
+        await say(call.message, "Type the accent, for example Scottish or Brazilian.")
+        return
+    pend["accent"] = None if key == "none" else key
+    await upd(u, pending_friend=pend)
+    await finish_friend(call.message, u)
+
+
+@router.callback_query(F.data == "fc:go")
+async def cb_friend_retry(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    await call.answer()
+    await finish_friend(call.message, u)
 
 
 # ---- stage 4 handlers: hints, stats, goals, reminders menu, voice ----
@@ -2215,7 +2535,9 @@ async def cb_voice_choice(call: CallbackQuery):
 async def cb_tts(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     await call.answer()
-    await send_voice_reply(call.bot, u, call.from_user.id, call.message.text or "")
+    tid = thread_of(call.message)
+    friend = await friend_by_thread(call.from_user.id, tid)
+    await send_voice_reply(call.bot, u, call.from_user.id, call.message.text or "", friend, tid)
 
 
 @router.message(Command("voicetest"))
