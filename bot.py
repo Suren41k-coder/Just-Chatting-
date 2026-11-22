@@ -314,6 +314,15 @@ async def friend_here(message) -> dict | None:
     return await friend_by_thread(message.from_user.id, thread_of(message))
 
 
+async def stray_topic(message, friend, notify: bool = True) -> bool:
+    """A topic that has no friend (deleted?) must never be answered with the history of another chat."""
+    if friend or not (thread_of(message) and getattr(message, "is_topic_message", False)):
+        return False
+    if notify:
+        await say(message, "This topic has no friend anymore. Delete it, or make a new friend with /create.")
+    return True
+
+
 async def add_friend(uid: int, name: str, about: str, voice: str, accent: str | None, thread_id: int) -> dict:
     global mem_friend_seq
     if pool is not None:
@@ -558,7 +567,9 @@ def build_prompt(u: dict, friend: dict | None = None) -> str:
         "Articles ALWAYS go to tips, never to mistakes: if one phrase has a verb problem and an article "
         "problem, explain only the verb problem in mistakes and put the article in tips. Only suggest "
         "what is truly missing; never claim something is missing that the user already wrote. "
-        "Never suggest formal alternatives for informal words like wanna or gonna."
+        "Never suggest formal alternatives for informal words like wanna or gonna. "
+        "Tips, like mistakes, are ONLY about the user's last message: never bring back a tip or a correction "
+        "from an earlier message."
     )
 
 class AIError(Exception):
@@ -599,6 +610,26 @@ def tip_in_text(tip: str, user_text: str) -> bool:
         return False
     phrase = norm_text(tip.split(":", 1)[1])
     return len(phrase) > 3 and phrase in norm_text(user_text)
+
+
+TIP_STOPWORDS = {"the", "an", "to", "on", "in", "of", "my", "you", "it", "is", "am", "are", "and", "or", "for",
+                 "at", "with", "me", "he", "she", "we", "they", "do", "be", "so", "as", "by", "your", "his", "her"}
+
+
+def content_words(text) -> set[str]:
+    return {w for w in norm_text(text).split() if len(w) >= 2 and w not in TIP_STOPWORDS}
+
+
+def tip_repeats_old(tip: str, user_text: str, history: list) -> bool:
+    """A tip that has nothing to do with the current message but matches an earlier message of this
+    chat is an old tip coming back."""
+    if ":" not in tip:
+        return False
+    words = content_words(tip.split(":", 1)[1])
+    if not words or words & content_words(user_text):
+        return False
+    return any(words & content_words(m.get("content", ""))
+               for m in history if m.get("role") == "user")
 
 
 def tip_same_sides(tip: str) -> bool:
@@ -782,7 +813,8 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True, friend: d
     if result is None:
         raise AIError(last_code)
     result["tips"] = [t for t in result.get("tips", [])
-                      if not tip_in_text(t, user_text) and not tip_same_sides(t)]
+                      if not tip_in_text(t, user_text) and not tip_same_sides(t)
+                      and not tip_repeats_old(t, user_text, history)]
     # a mistake must quote words from this very message, otherwise the model is repeating an old one
     result["mistakes"] = [m for m in result.get("mistakes", [])
                           if norm_text(m["quote"]) and norm_text(m["quote"]) in norm_text(user_text)]
@@ -1910,6 +1942,9 @@ async def cmd_start(message: Message):
 @router.message(Command("stop"))
 async def cmd_stop(message: Message):
     u = await get_user(message.from_user.id)
+    if await friend_here(message):  # keep the chats apart: /stop belongs to the main chat only
+        await say(message, "Send /new here to clear this chat, or delete the friend in /friends.")
+        return
     await reset_chat(u)
     await message.answer("Chat ended. Send /new whenever you want to talk again 👋")
 
@@ -2166,6 +2201,8 @@ async def on_voice(message: Message):
         await say(message, "Please type that as text 👇")
         return
     friend = await friend_here(message)
+    if await stray_topic(message, friend):
+        return
     if not friend and not await ensure_active(message, u):
         return
     if message.voice.duration > MAX_VOICE_SECONDS:
@@ -2235,6 +2272,8 @@ async def on_text(message: Message):
             await message.answer("Please type the time like 09:30.")
         return
     friend = await friend_here(message)
+    if await stray_topic(message, friend):
+        return
     if not friend and not await ensure_active(message, u):
         return
     await mark_user_message(u, friend)
@@ -2250,6 +2289,8 @@ async def on_media(message: Message):
     uid = message.from_user.id
     u = await get_user(uid)
     friend = await friend_here(message)
+    if await stray_topic(message, friend, notify=False):
+        return
     if not (friend or u["active"]) or not cooldown_ok(uid):
         return
     kind = message.content_type.value
