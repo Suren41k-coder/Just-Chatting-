@@ -189,6 +189,8 @@ MISTAKE_RULES = (
     "Do not put articles, subtle, stylistic or optional choices (a slightly less natural word like "
     "'meal' vs 'food', 'the' vs no article when both work) into mistakes; they go into tips (see below).\n"
     "Before answering, double-check that each correction and both example sentences are fully correct English.\n"
+    "Check ONLY the user's last message: quote only words that appear in it, and never repeat a correction "
+    "for something they wrote in an earlier message.\n"
 )
 
 
@@ -325,7 +327,8 @@ async def add_friend(uid: int, name: str, about: str, voice: str, accent: str | 
             log.exception("add_friend failed")
     mem_friend_seq += 1
     f = {"id": mem_friend_seq, "user_id": uid, "name": name, "about": about, "voice": voice,
-         "accent": accent, "thread_id": thread_id, "history": [], "mem": True}
+         "accent": accent, "thread_id": thread_id, "history": [], "mem": True,
+         "last_user_ts": None, "last_bot_ts": None, "hint_sent": False, "hint_ts": None}
     mem_friends[f["id"]] = f
     return f
 
@@ -372,6 +375,9 @@ async def init_db() -> None:
             await conn.execute(
                 "CREATE TABLE IF NOT EXISTS friends (id bigserial PRIMARY KEY, user_id bigint, name text, "
                 "about text, voice text, accent text, thread_id bigint, history jsonb DEFAULT '[]'::jsonb)")
+            for col, typ in (("last_user_ts", "double precision"), ("last_bot_ts", "double precision"),
+                             ("hint_sent", "boolean"), ("hint_ts", "double precision")):
+                await conn.execute(f"ALTER TABLE friends ADD COLUMN IF NOT EXISTS {col} {typ}")
             for table in ("users", "allowed", "friends"):  # keep the Supabase API closed for every table
                 try:
                     await conn.execute(f"ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY")
@@ -777,6 +783,9 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True, friend: d
         raise AIError(last_code)
     result["tips"] = [t for t in result.get("tips", [])
                       if not tip_in_text(t, user_text) and not tip_same_sides(t)]
+    # a mistake must quote words from this very message, otherwise the model is repeating an old one
+    result["mistakes"] = [m for m in result.get("mistakes", [])
+                          if norm_text(m["quote"]) and norm_text(m["quote"]) in norm_text(user_text)]
 
     new_history = list(history)
     if save_user_text:
@@ -886,7 +895,10 @@ async def send_ai_result(message: Message, u: dict, result: dict, friend: dict |
     tips = result.get("tips") or []
     if tips and u["tips_on"]:
         await say(message, "\n".join(f"💡 <i>{html.escape(t)}</i>" for t in tips), tid)
-    await upd(u, last_bot_ts=time.time(), hint_sent=False)
+    if friend:  # a friend's silence is tracked separately from the main chat
+        await upd_friend(friend, last_bot_ts=time.time(), hint_sent=False)
+    else:
+        await upd(u, last_bot_ts=time.time(), hint_sent=False)
 
 
 async def safe_ai(message: Message, u: dict, text: str, save_user_text: bool = True,
@@ -923,10 +935,13 @@ async def prepare_story(n: int) -> None:
         log.exception("story preparation failed")
 
 
-def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows]
-    )
+def kb(rows: list[list[tuple]]) -> InlineKeyboardMarkup:
+    """Rows of (text, callback_data) or (text, callback_data, style); style: success=green, danger=red, primary=blue."""
+    def button(t, d, style=None):
+        extra = {"style": style} if style else {}
+        return InlineKeyboardButton(text=t, callback_data=d, **extra)
+
+    return InlineKeyboardMarkup(inline_keyboard=[[button(*item) for item in row] for row in rows])
 
 
 def streak_kb(n: int, counted: bool) -> InlineKeyboardMarkup:
@@ -1508,10 +1523,10 @@ HINT_PROMPT = (
 )
 
 
-async def gen_hint(u: dict) -> str | None:
+async def gen_hint(u: dict, friend: dict | None = None) -> str | None:
     level = LEVELS.get(u["level"], "unknown")
     data = await ai_json(HINT_PROMPT.format(level=level), "Suggest what I could say next.",
-                         (u.get("history") or [])[-6:])
+                         ((friend or u).get("history") or [])[-6:])
     hints = (data or {}).get("hints") if isinstance(data, dict) else None
     if not hints:
         return None
@@ -1602,12 +1617,28 @@ async def nudge_one(bot: Bot, u: dict) -> None:
             return
 
 
+async def friend_hints(bot: Bot, u: dict) -> None:
+    """Silence hint inside a friend's topic: he stopped answering, so send ideas into that topic."""
+    if not u["hints_on"]:
+        return
+    now_ts = time.time()
+    for f in await friends_of(u["user_id"]):
+        last_bot, last_user = f.get("last_bot_ts"), f.get("last_user_ts")
+        waiting = bool(last_bot) and (last_user is None or last_user < last_bot)
+        if waiting and not f.get("hint_sent") and now_ts - last_bot >= u["hint_min"] * 60:
+            await upd_friend(f, hint_sent=True, hint_ts=now_ts)
+            text = await gen_hint(u, f)
+            if text:
+                await bot.send_message(u["user_id"], text, message_thread_id=f["thread_id"])
+
+
 async def nudge_loop(bot: Bot) -> None:
     while True:
         try:
             for u in await all_users():
                 try:
                     await nudge_one(bot, u)
+                    await friend_hints(bot, u)
                 except Exception:
                     log.exception("nudge failed for %s", u.get("user_id"))
         except Exception:
@@ -1615,8 +1646,10 @@ async def nudge_loop(bot: Bot) -> None:
         await asyncio.sleep(NUDGE_TICK_SECONDS)
 
 
-async def mark_user_message(u: dict) -> None:
+async def mark_user_message(u: dict, friend: dict | None = None) -> None:
     await upd(u, last_user_ts=time.time(), hint_sent=False, remind_sent=0)
+    if friend:
+        await upd_friend(friend, last_user_ts=time.time(), hint_sent=False)
 
 
 async def ensure_active(message: Message, u: dict) -> bool:
@@ -1772,22 +1805,24 @@ def time_kb():
 
 
 def settings_kb(u: dict):
-    def mark(value: bool) -> str:
-        return "✅" if value else "❌"
+    def tog(label: str, value: bool, data: str):  # green when on, red when off
+        return (f"{'✅' if value else '❌'} {label}", data, "success" if value else "danger")
 
     style_label = STYLES.get(u["style"], STYLES[DEFAULT_STYLE])[0]
+    voice_on = u["voice_mode"] != "off"
     return kb([
-        [(f"{mark(u['emoji'])} Emoji", "set:emoji"), (f"{mark(u['tips_on'])} Tips 💡", "set:tips")],
-        [(f"{mark(u['streak_on'])} Streak", "set:streak"), (f"{mark(u['pin_on'])} Pin streak", "set:pin")],
-        [(f"{mark(u['morning_on'])} Morning message", "set:morning")],
+        [tog("Emoji", u["emoji"], "set:emoji"), tog("Tips 💡", u["tips_on"], "set:tips")],
+        [tog("Streak", u["streak_on"], "set:streak"), tog("Pin streak", u["pin_on"], "set:pin")],
+        [tog("Morning message", u["morning_on"], "set:morning")],
         [(f"🗣 Explanations: {'English' if u['explain_lang'] == 'en' else 'Русский'}", "set:lang")],
         [(f"🎭 Style: {style_label}", "set:style")],
         [(f"🕒 Time zone: {tz_label(u['tz'])}", "set:tz")],
         [(f"⏰ Morning time: {u['morning_time']}", "set:time")],
-        [(f"{mark(u['hints_on'])} Silence hints", "set:hints"), (f"{mark(u['weak_on'])} Weak spots", "set:weak")],
+        [tog("Silence hints", u["hints_on"], "set:hints"), tog("Weak spots", u["weak_on"], "set:weak")],
         [(f"💡 Hint after: {u['hint_min']} min", "set:hmin")],
-        [(f"{mark(u['remind_on'])} Reminders", "set:remind"), ("🔔 Reminder timing", "set:rm")],
-        [(f"🔊 Voice replies: {VOICE_MODE_LABELS.get(u['voice_mode'], 'off')}", "set:voice"),
+        [tog("Reminders", u["remind_on"], "set:remind"), ("🔔 Reminder timing", "set:rm")],
+        [(f"🔊 Voice replies: {VOICE_MODE_LABELS.get(u['voice_mode'], 'off')}", "set:voice",
+          "success" if voice_on else "danger"),
          ("🎙 Voice choice", "set:vchoice")],
     ])
 
@@ -2136,7 +2171,7 @@ async def on_voice(message: Message):
     if message.voice.duration > MAX_VOICE_SECONDS:
         await say(message, "Please keep voice messages under 60 seconds 🎙️")
         return
-    await mark_user_message(u)
+    await mark_user_message(u, friend)
     try:
         buf = BytesIO()
         await message.bot.download(message.voice, destination=buf)
@@ -2202,7 +2237,7 @@ async def on_text(message: Message):
     friend = await friend_here(message)
     if not friend and not await ensure_active(message, u):
         return
-    await mark_user_message(u)
+    await mark_user_message(u, friend)
     prev_bot = last_assistant(friend or u)
     result = await safe_ai(message, u, message.text, friend=friend)
     if result:
@@ -2392,11 +2427,12 @@ GOAL_ASK_TEXT = ("Send me what you want to practice: words, expressions, phrasal
 @router.message(Command("hint"))
 async def cmd_hint(message: Message):
     u = await get_user(message.from_user.id)
-    if not u["active"]:
+    friend = await friend_here(message)
+    if not friend and not u["active"]:
         await message.answer("Start a conversation first: /start")
         return
-    text = await gen_hint(u)
-    await message.answer(text or "I could not think of a hint right now. Try again in a minute.")
+    text = await gen_hint(u, friend)
+    await say(message, text or "I could not think of a hint right now. Try again in a minute.")
 
 
 @router.message(Command("stats"))
