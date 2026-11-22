@@ -213,7 +213,7 @@ USER_DEFAULTS = {
     "remind_sent": 0, "remind_ts": None, "quiet_from": "23:00", "quiet_to": "09:00",
     "voice_mode": "off", "tts_voice": "gemini:Kore", "weak_on": True, "last_weak": None,
     "stats": {}, "goals": [], "pending_goal": None, "last_hint": None, "last_hint_ts": None,
-    "pending_friend": None,
+    "pending_friend": None, "main_thread": None, "cmd_thread": None,
 }
 COLUMN_TYPES = {
     "level": "text", "topic": "text", "style": "text", "explain_lang": "text", "tz": "text",
@@ -228,7 +228,7 @@ COLUMN_TYPES = {
     "remind_ts": "double precision", "quiet_from": "text", "quiet_to": "text", "voice_mode": "text",
     "tts_voice": "text", "weak_on": "boolean", "last_weak": "date", "stats": "jsonb", "goals": "jsonb",
     "pending_goal": "jsonb", "last_hint": "text", "last_hint_ts": "double precision",
-    "pending_friend": "jsonb",
+    "pending_friend": "jsonb", "main_thread": "bigint", "cmd_thread": "bigint",
 }
 
 
@@ -314,13 +314,57 @@ async def friend_here(message) -> dict | None:
     return await friend_by_thread(message.from_user.id, thread_of(message))
 
 
-async def stray_topic(message, friend, notify: bool = True) -> bool:
-    """A topic that has no friend (deleted?) must never be answered with the history of another chat."""
-    if friend or not (thread_of(message) and getattr(message, "is_topic_message", False)):
-        return False
-    if notify:
-        await say(message, "This topic has no friend anymore. Delete it, or make a new friend with /create.")
-    return True
+def topics_on(u: dict) -> bool:
+    """The Main and Commands topics exist (made by /start)."""
+    return bool(u.get("main_thread") and u.get("cmd_thread"))
+
+
+def main_kw(u: dict) -> dict:
+    """Where the bot writes by itself (streak, morning message, reminders, hints): the Main topic."""
+    return {"message_thread_id": u["main_thread"]} if topics_on(u) else {}
+
+
+async def route(message, u: dict) -> tuple[str, dict | None]:
+    """Which chat a message belongs to: 'friend', 'main', 'cmd' (Commands topic) or 'other' (any stray topic)."""
+    tid = thread_of(message)
+    friend = await friend_by_thread(u["user_id"], tid)
+    if friend:
+        return "friend", friend
+    if not topics_on(u) or not tid or tid == u["main_thread"]:
+        return "main", None
+    if tid == u["cmd_thread"]:
+        return "cmd", None
+    return "other", None
+
+
+WRONG_TOPIC = {
+    "cmd": "This topic is for commands. Let's chat in Main, open it in the sidebar 👉",
+    "other": "Let's chat in Main, open it in the sidebar 👉 (commands live in Commands).",
+}
+CHAT_COMMANDS = {"new", "stop", "hint"}  # allowed inside Main and friend topics; the rest live in Commands
+
+
+async def topic_alive(bot, chat_id: int, thread_id: int) -> bool:
+    try:
+        await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+        return True
+    except Exception as e:
+        return "thread" not in str(e).lower()  # only a missing topic counts, not a network hiccup
+
+
+async def ensure_topics(bot, u: dict) -> None:
+    """Creates the Main and Commands topics (or makes them again if one was deleted)."""
+    for field, name in (("main_thread", "Main"), ("cmd_thread", "Commands")):
+        if u.get(field) and not await topic_alive(bot, u["user_id"], u[field]):
+            await upd(u, **{field: None})
+        if u.get(field):
+            continue
+        try:
+            topic = await bot.create_forum_topic(chat_id=u["user_id"], name=name)
+        except Exception:
+            log.warning("could not create the %s topic (are topics on in BotFather?)", name)
+            return
+        await upd(u, **{field: topic.message_thread_id})
 
 
 async def add_friend(uid: int, name: str, about: str, voice: str, accent: str | None, thread_id: int) -> dict:
@@ -987,14 +1031,15 @@ def streak_kb(n: int, counted: bool) -> InlineKeyboardMarkup:
     return kb([[("✅ Count today", "streak:count")]])
 
 
-async def send_story_file(bot: Bot, chat_id: int, n: int) -> None:
+async def send_story_file(bot: Bot, chat_id: int, n: int, thread_id: int | None = None) -> None:
     """Sends the rendered story to the chat, so it can be posted as a story by hand."""
     path, kind = await asyncio.to_thread(story.ensure_story, n)
     caption = f"{n} {'day' if n == 1 else 'days'} in a row. Save it and post it as a story."
+    kw = {"message_thread_id": thread_id} if thread_id else {}
     if kind == "mp4":
-        await bot.send_video(chat_id, FSInputFile(path), caption=caption, supports_streaming=True)
+        await bot.send_video(chat_id, FSInputFile(path), caption=caption, supports_streaming=True, **kw)
     else:
-        await bot.send_photo(chat_id, FSInputFile(path), caption=caption)
+        await bot.send_photo(chat_id, FSInputFile(path), caption=caption, **kw)
 
 
 async def unpin_old(bot: Bot, u: dict) -> None:
@@ -1010,7 +1055,7 @@ async def unpin_old(bot: Bot, u: dict) -> None:
 
 async def announce_day(bot: Bot, u: dict, n: int) -> None:
     msg = await bot.send_message(u["user_id"], f"Day {n}{fire(u)} Today is counted.",
-                                 reply_markup=streak_kb(n, counted=True))
+                                 reply_markup=streak_kb(n, counted=True), **main_kw(u))
     if u["pin_on"]:
         await unpin_old(bot, u)
         try:
@@ -1073,7 +1118,7 @@ async def morning_one(bot: Bot, u: dict) -> None:
     if note:
         text += "\n" + note
         await upd(u, last_weak=today)
-    await bot.send_message(u["user_id"], text, reply_markup=streak_kb(0, counted=False))
+    await bot.send_message(u["user_id"], text, reply_markup=streak_kb(0, counted=False), **main_kw(u))
 
 
 async def morning_loop(bot: Bot) -> None:
@@ -1612,7 +1657,7 @@ async def nudge_one(bot: Bot, u: dict) -> None:
             text = await gen_hint(u)
             await upd(u, hint_sent=True, hint_ts=now_ts)
             if text:
-                await bot.send_message(uid, text)
+                await bot.send_message(uid, text, **main_kw(u))
             return
         if u["hint_sent"] and now_ts - (u.get("hint_ts") or now_ts) >= wait:
             await upd(u, active=False, silence_end=True, hint_sent=False)
@@ -1630,7 +1675,7 @@ async def nudge_one(bot: Bot, u: dict) -> None:
             if (now_ts - last_user >= threshold and gap_ok and not counted
                     and not in_quiet_hours(u, now_local)):
                 await upd(u, remind_sent=sent + 1, remind_ts=now_ts)
-                await bot.send_message(uid, html.escape(await gen_nudge(u)))
+                await bot.send_message(uid, html.escape(await gen_nudge(u)), **main_kw(u))
                 return
 
     # 3) goal reports on the last day of a goal (or later, if the bot was off)
@@ -1639,7 +1684,7 @@ async def nudge_one(bot: Bot, u: dict) -> None:
         end = date.fromisoformat(g["end"])
         if now_local.date() > end or (now_local.date() == end and now_local.hour >= GOAL_REPORT_HOUR):
             for part in goal_report(g):
-                await bot.send_message(uid, part)
+                await bot.send_message(uid, part, **main_kw(u))
             g["done"] = True
             for it in g["items"]:
                 it["seen"] = []
@@ -1690,7 +1735,7 @@ async def ensure_active(message: Message, u: dict) -> bool:
     if u["silence_end"] or u["remind_sent"] > 0:  # he is back after a pause: just continue
         await upd(u, active=True, silence_end=False)
         return True
-    await message.answer("Send /start to begin 🙂")
+    await say(message, "Send /start to begin 🙂")
     return False
 
 
@@ -1879,11 +1924,29 @@ class AccessMiddleware(BaseMiddleware):
         return None
 
 
+class TopicMiddleware(BaseMiddleware):
+    """Keeps the topics apart: commands (except /start, /new, /stop, /hint) only work in Commands."""
+
+    async def __call__(self, handler, event, data):
+        text = getattr(event, "text", None) or ""
+        user = getattr(event, "from_user", None)
+        if text.startswith("/") and user and not getattr(user, "is_bot", False):
+            u = await get_user(user.id)
+            if topics_on(u):
+                name = (text[1:].split() or [""])[0].split("@")[0].lower()
+                kind, _ = await route(event, u)
+                if not (name == "start" or kind == "cmd" or (kind in ("main", "friend") and name in CHAT_COMMANDS)):
+                    await say(event, "Commands live in the Commands topic, open it in the sidebar 👉")
+                    return None
+        return await handler(event, data)
+
+
 router = Router()
 router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
 router.message.outer_middleware(AccessMiddleware())
 router.callback_query.outer_middleware(AccessMiddleware())
+router.message.outer_middleware(TopicMiddleware())
 
 last_message_at: dict[int, float] = {}
 
@@ -1926,17 +1989,20 @@ ADMIN_HELP = (
 @router.message(Command("start", "new"))
 async def cmd_start(message: Message):
     u = await get_user(message.from_user.id)
-    friend = await friend_here(message)
+    kind, friend = await route(message, u)
     if friend:  # inside a friend's topic: just clear that conversation
         await upd_friend(friend, history=[])
         await say(message, "Fresh start 👋")
         return
+    await ensure_topics(message.bot, u)
     await reset_chat(u)
-    await message.answer(
-        "Hey! 👋 I'm here to help you practice English. Just chat with me, "
-        "and I'll gently point out mistakes.",
-        reply_markup=kb([[("Start a conversation", "go")]]),
-    )
+    tid = u["main_thread"] if topics_on(u) else None
+    await say(message,
+              "Hey! 👋 I'm here to help you practice English. Just chat with me, "
+              "and I'll gently point out mistakes.",
+              tid, reply_markup=kb([[("Start a conversation", "go")]]))
+    if tid and thread_of(message) != tid:
+        await say(message, "Let's chat in Main, open it in the sidebar 👉")
 
 
 @router.message(Command("stop"))
@@ -1946,37 +2012,37 @@ async def cmd_stop(message: Message):
         await say(message, "Send /new here to clear this chat, or delete the friend in /friends.")
         return
     await reset_chat(u)
-    await message.answer("Chat ended. Send /new whenever you want to talk again 👋")
+    await say(message, "Chat ended. Send /new whenever you want to talk again 👋")
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     text = HELP_TEXT + (ADMIN_HELP if message.from_user.id == ADMIN_ID else "")
-    await message.answer(text)
+    await say(message, text)
 
 
 @router.message(Command("style"))
 async def cmd_style(message: Message):
-    await message.answer("Pick the vibe of our chat:", reply_markup=style_kb())
+    await say(message, "Pick the vibe of our chat:", reply_markup=style_kb())
 
 
 @router.message(Command("settings"))
 async def cmd_settings(message: Message):
     u = await get_user(message.from_user.id)
-    await message.answer("⚙️ Settings", reply_markup=settings_kb(u))
+    await say(message, "⚙️ Settings", reply_markup=settings_kb(u))
 
 
 @router.message(Command("streak"))
 async def cmd_streak(message: Message):
     u = await get_user(message.from_user.id)
     if not u["streak_on"]:
-        await message.answer("The streak is turned off. You can turn it on in /settings.")
+        await say(message, "The streak is turned off. You can turn it on in /settings.")
         return
     counted = u["last_day"] == local_today(u)
     text = f"Streak: {u['streak']}{fire(u)} (best: {u['best_streak']})\n"
     text += "Today is counted." if counted else \
         f"Today is not counted yet: {STREAK_MESSAGES} messages in a conversation count the day."
-    await message.answer(text, reply_markup=streak_kb(u["streak"], counted))
+    await say(message, text, reply_markup=streak_kb(u["streak"], counted))
 
 
 # ---- admin commands ----
@@ -1986,10 +2052,10 @@ async def cmd_allow(message: Message, command: CommandObject):
         return
     arg = (command.args or "").strip()
     if not arg.isdigit():
-        await message.answer("Usage: /allow 123456789")
+        await say(message, "Usage: /allow 123456789")
         return
     await set_allowed(int(arg), True)
-    await message.answer(f"Access granted to {arg}.")
+    await say(message, f"Access granted to {arg}.")
 
 
 @router.message(Command("deny"))
@@ -1998,17 +2064,17 @@ async def cmd_deny(message: Message, command: CommandObject):
         return
     arg = (command.args or "").strip()
     if not arg.isdigit():
-        await message.answer("Usage: /deny 123456789")
+        await say(message, "Usage: /deny 123456789")
         return
     await set_allowed(int(arg), False)
-    await message.answer(f"Access removed for {arg}.")
+    await say(message, f"Access removed for {arg}.")
 
 
 @router.message(Command("allowed"))
 async def cmd_allowed(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer("Allowed IDs: " + (", ".join(str(i) for i in sorted(allowed)) or "nobody yet"))
+    await say(message, "Allowed IDs: " + (", ".join(str(i) for i in sorted(allowed)) or "nobody yet"))
 
 
 @router.message(Command("setstreak"))
@@ -2017,7 +2083,7 @@ async def cmd_setstreak(message: Message, command: CommandObject):
         return
     arg = (command.args or "").strip()
     if not arg.isdigit() or int(arg) > 9999:
-        await message.answer("Usage: /setstreak 30")
+        await say(message, "Usage: /setstreak 30")
         return
     n = int(arg)
     u = await get_user(message.from_user.id)
@@ -2030,13 +2096,13 @@ async def cmd_setstreak(message: Message, command: CommandObject):
         await announce_day(message.bot, u, n)
     else:
         await unpin_old(message.bot, u)
-        await message.answer("Streak set to 0.")
+        await say(message, "Streak set to 0.")
 
 
 # ---- callbacks ----
 @router.callback_query(F.data == "go")
 async def cb_go(call: CallbackQuery):
-    await call.message.answer("What's your level? You can skip this, I'll adapt as we chat.",
+    await say(call.message, "What's your level? You can skip this, I'll adapt as we chat.",
                               reply_markup=level_kb())
     await call.answer()
 
@@ -2046,7 +2112,7 @@ async def cb_level(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     value = call.data.split(":", 1)[1]
     await upd(u, level=value if value in LEVELS else None)
-    await call.message.answer("Pick a topic, write your own, or skip.", reply_markup=topic_kb())
+    await say(call.message, "Pick a topic, write your own, or skip.", reply_markup=topic_kb())
     await call.answer()
 
 
@@ -2063,7 +2129,7 @@ async def cb_topic(call: CallbackQuery):
     await call.answer()
     if value == "own":
         await upd(u, awaiting="topic")
-        await call.message.answer("Type the topic you want to talk about 👇")
+        await say(call.message, "Type the topic you want to talk about 👇")
         return
     await upd(u, topic=None if value == "skip" else value)
     await begin_chat(call.message, u)
@@ -2077,7 +2143,7 @@ async def cb_style(call: CallbackQuery):
         return
     u = await get_user(call.from_user.id)
     await upd(u, style=key)
-    await call.message.answer(f"Vibe set: {STYLES[key][0]}. Just keep chatting 🙂")
+    await say(call.message, f"Vibe set: {STYLES[key][0]}. Just keep chatting 🙂")
 
 
 @router.callback_query(F.data.startswith("set:"))
@@ -2098,19 +2164,19 @@ async def cb_set(call: CallbackQuery):
     elif key == "voice":
         await upd(u, voice_mode={"off": "button", "button": "always", "always": "off"}.get(u["voice_mode"], "off"))
     elif key == "vchoice":
-        await call.message.answer("Pick a voice (or send /voicetest to hear them):", reply_markup=voice_kb())
+        await say(call.message, "Pick a voice (or send /voicetest to hear them):", reply_markup=voice_kb())
         return
     elif key == "rm":
-        await call.message.answer("🔔 " + reminder_summary(u), reply_markup=reminder_kb())
+        await say(call.message, "🔔 " + reminder_summary(u), reply_markup=reminder_kb())
         return
     elif key == "style":
-        await call.message.answer("Pick the vibe of our chat:", reply_markup=style_kb())
+        await say(call.message, "Pick the vibe of our chat:", reply_markup=style_kb())
         return
     elif key == "tz":
-        await call.message.answer("Pick your time zone or type your own:", reply_markup=tz_kb())
+        await say(call.message, "Pick your time zone or type your own:", reply_markup=tz_kb())
         return
     elif key == "time":
-        await call.message.answer("When should the morning message come?", reply_markup=time_kb())
+        await say(call.message, "When should the morning message come?", reply_markup=time_kb())
         return
     try:
         await call.message.edit_reply_markup(reply_markup=settings_kb(u))
@@ -2125,12 +2191,12 @@ async def cb_tz(call: CallbackQuery):
     await call.answer()
     if value == "other":
         await upd(u, awaiting="tz")
-        await call.message.answer("Type a time zone like Europe/Berlin or an offset like +3 👇")
+        await say(call.message, "Type a time zone like Europe/Berlin or an offset like +3 👇")
         return
     name = parse_tz(value)
     if name:
         await upd(u, tz=name)
-        await call.message.answer(f"Time zone set: {tz_label(name)}")
+        await say(call.message, f"Time zone set: {tz_label(name)}")
 
 
 @router.callback_query(F.data.startswith("tm:"))
@@ -2140,12 +2206,12 @@ async def cb_time(call: CallbackQuery):
     await call.answer()
     if value == "other":
         await upd(u, awaiting="time")
-        await call.message.answer("Type the time like 09:30 👇")
+        await say(call.message, "Type the time like 09:30 👇")
         return
     hhmm = parse_hhmm(value)
     if hhmm:
         await upd(u, morning_time=hhmm)
-        await call.message.answer(f"Morning message time set: {hhmm}")
+        await say(call.message, f"Morning message time set: {hhmm}")
 
 
 @router.callback_query(F.data == "streak:count")
@@ -2171,10 +2237,10 @@ async def cb_streak_file(call: CallbackQuery):
         return
     await call.answer("Preparing the file...")
     try:
-        await send_story_file(call.bot, call.from_user.id, n)
+        await send_story_file(call.bot, call.from_user.id, n, thread_of(call.message))
     except Exception:
         log.exception("send story file failed")
-        await call.message.answer("Could not prepare the file. Try again in a minute.")
+        await say(call.message, "Could not prepare the file. Try again in a minute.")
 
 
 @router.callback_query(F.data == "streak:undo")
@@ -2200,8 +2266,9 @@ async def on_voice(message: Message):
     if u["awaiting"]:
         await say(message, "Please type that as text 👇")
         return
-    friend = await friend_here(message)
-    if await stray_topic(message, friend):
+    kind, friend = await route(message, u)
+    if kind in WRONG_TOPIC:
+        await say(message, WRONG_TOPIC[kind])
         return
     if not friend and not await ensure_active(message, u):
         return
@@ -2250,7 +2317,7 @@ async def on_text(message: Message):
         if digits.isdigit() and 1 <= int(digits) <= 365:
             await create_goal(message, u, int(digits))
         else:
-            await message.answer("Please type a number of days from 1 to 365.")
+            await say(message, "Please type a number of days from 1 to 365.")
         return
     if awaiting in ("fr_name", "fr_about", "fr_accent"):
         await friend_dialog_text(message, u, awaiting)
@@ -2259,20 +2326,21 @@ async def on_text(message: Message):
         name = parse_tz(message.text)
         if name:
             await upd(u, tz=name, awaiting=None)
-            await message.answer(f"Time zone set: {tz_label(name)}")
+            await say(message, f"Time zone set: {tz_label(name)}")
         else:
-            await message.answer("I don't know that one. Try Europe/Berlin or an offset like +3.")
+            await say(message, "I don't know that one. Try Europe/Berlin or an offset like +3.")
         return
     if awaiting == "time":
         hhmm = parse_hhmm(message.text)
         if hhmm:
             await upd(u, morning_time=hhmm, awaiting=None)
-            await message.answer(f"Morning message time set: {hhmm}")
+            await say(message, f"Morning message time set: {hhmm}")
         else:
-            await message.answer("Please type the time like 09:30.")
+            await say(message, "Please type the time like 09:30.")
         return
-    friend = await friend_here(message)
-    if await stray_topic(message, friend):
+    kind, friend = await route(message, u)
+    if kind in WRONG_TOPIC:
+        await say(message, WRONG_TOPIC[kind])
         return
     if not friend and not await ensure_active(message, u):
         return
@@ -2288,8 +2356,8 @@ async def on_text(message: Message):
 async def on_media(message: Message):
     uid = message.from_user.id
     u = await get_user(uid)
-    friend = await friend_here(message)
-    if await stray_topic(message, friend, notify=False):
+    kind, friend = await route(message, u)
+    if kind in WRONG_TOPIC:
         return
     if not (friend or u["active"]) or not cooldown_ok(uid):
         return
@@ -2470,7 +2538,7 @@ async def cmd_hint(message: Message):
     u = await get_user(message.from_user.id)
     friend = await friend_here(message)
     if not friend and not u["active"]:
-        await message.answer("Start a conversation first: /start")
+        await say(message, "Start a conversation first: /start")
         return
     text = await gen_hint(u, friend)
     await say(message, text or "I could not think of a hint right now. Try again in a minute.")
@@ -2482,7 +2550,7 @@ async def cmd_stats(message: Message):
     s = build_stats(u)
     text = stats_text(u, s)
     if not await send_widget(message.chat.id, STATS_WIDGET_HTML, text, widget_payload(u, s)):
-        await message.answer(text)
+        await say(message, text)
 
 
 @router.message(Command("setagoal", ignore_case=True))
@@ -2491,10 +2559,10 @@ async def cmd_setagoal(message: Message):
     goals = active_goals(u)
     if not goals:
         await upd(u, awaiting="goal_text")
-        await message.answer(GOAL_ASK_TEXT)
+        await say(message, GOAL_ASK_TEXT)
         return
     rows = [[("➕ New goal", "ga:new")]] + [[(f"🗑 Delete {g['name']}", f"ga:del:{g['id']}")] for g in goals]
-    await message.answer("Your goals:\n" + "\n".join(goal_progress_line(u, g) for g in goals),
+    await say(message, "Your goals:\n" + "\n".join(goal_progress_line(u, g) for g in goals),
                          reply_markup=kb(rows))
 
 
@@ -2505,15 +2573,15 @@ async def cb_goal_menu(call: CallbackQuery):
     await call.answer()
     if parts[1] == "new":
         await upd(u, awaiting="goal_text")
-        await call.message.answer(GOAL_ASK_TEXT)
+        await say(call.message, GOAL_ASK_TEXT)
     elif parts[1] == "del" and len(parts) == 3 and parts[2].isdigit():
         gid = int(parts[2])
         await upd(u, goals=[g for g in u["goals"] if g["id"] != gid])
-        await call.message.answer("Goal deleted.")
+        await say(call.message, "Goal deleted.")
 
 
 async def handle_goal_text(message: Message, u: dict) -> None:
-    await message.answer("Reading your list...")
+    await say(message, "Reading your list...")
     data = await ai_json(GOAL_PARSE_PROMPT, message.text[:2000])
     items: list[dict] = []
     if isinstance(data, dict) and isinstance(data.get("items"), list):
@@ -2523,23 +2591,23 @@ async def handle_goal_text(message: Message, u: dict) -> None:
     if not items:
         items = fallback_items(message.text)
     if not items:
-        await message.answer("I could not find anything there. Send the words separated by commas.")
+        await say(message, "I could not find anything there. Send the words separated by commas.")
         return
     await upd(u, pending_goal={"items": items}, awaiting=None)
     text = (f"I found {len(items)} items:\n" + "\n".join(f"• {html.escape(i['t'])}" for i in items) +
             "\n\nFor how long should I track them?")
-    await message.answer(text, reply_markup=kb([[("7 days", "gd:7"), ("14 days", "gd:14"), ("30 days", "gd:30")],
+    await say(message, text, reply_markup=kb([[("7 days", "gd:7"), ("14 days", "gd:14"), ("30 days", "gd:30")],
                                                 [("✍️ Custom", "gd:custom"), ("✖ Cancel", "gd:cancel")]]))
 
 
 async def create_goal(message: Message, u: dict, days: int) -> None:
     pending = u.get("pending_goal")
     if not pending or not pending.get("items"):
-        await message.answer("There is nothing to create. Start again with /setagoal.")
+        await say(message, "There is nothing to create. Start again with /setagoal.")
         return
     goal = new_goal(u, pending["items"], days)
     await upd(u, goals=(u.get("goals") or []) + [goal], pending_goal=None, awaiting=None)
-    await message.answer(f"Done: {goal['name']} for {days} days ({len(goal['items'])} items), until {goal['end']}. "
+    await say(message, f"Done: {goal['name']} for {days} days ({len(goal['items'])} items), until {goal['end']}. "
                          f"I will just watch how you use them. The report comes on the last day at "
                          f"{GOAL_REPORT_HOUR}:00.")
 
@@ -2551,10 +2619,10 @@ async def cb_goal_days(call: CallbackQuery):
     await call.answer()
     if value == "cancel":
         await upd(u, pending_goal=None, awaiting=None)
-        await call.message.answer("Cancelled.")
+        await say(call.message, "Cancelled.")
     elif value == "custom":
         await upd(u, awaiting="goal_days")
-        await call.message.answer("How many days? Type a number from 1 to 365.")
+        await say(call.message, "How many days? Type a number from 1 to 365.")
     elif value.isdigit():
         await create_goal(call.message, u, int(value))
 
@@ -2605,7 +2673,7 @@ async def cb_voice_choice(call: CallbackQuery):
     await call.answer()
     if (provider == "gemini" and voice in GEMINI_VOICES) or (provider == "edge" and voice in EDGE_VOICES):
         await upd(u, tts_voice=f"{provider}:{voice}")
-        await call.message.answer(f"Voice set: {voice} ({provider}). Try /voicetest or turn on voice replies in /settings.")
+        await say(call.message, f"Voice set: {voice} ({provider}). Try /voicetest or turn on voice replies in /settings.")
 
 
 @router.callback_query(F.data == "tts:go")
@@ -2621,18 +2689,19 @@ async def cb_tts(call: CallbackQuery):
 async def cmd_voicetest(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer("Sending voice samples one by one, it can take a minute...")
+    await say(message, "Sending voice samples one by one, it can take a minute...")
     tests = ([("gemini", v) for v in GEMINI_VOICES] if GEMINI_API_KEY else []) + [("edge", v) for v in EDGE_VOICES]
     for provider, voice in tests:
         try:
             data, mime = await (tts_gemini if provider == "gemini" else tts_edge)(VOICE_SAMPLE, voice)
             ogg = await asyncio.to_thread(to_ogg_opus, data, mime)
             await message.bot.send_voice(message.chat.id, BufferedInputFile(ogg, filename="sample.ogg"),
-                                         caption=f"{provider}: {voice}")
+                                         caption=f"{provider}: {voice}",
+                                         **({"message_thread_id": thread_of(message)} if thread_of(message) else {}))
         except Exception as e:
             log.warning("voicetest %s %s failed: %s", provider, voice, str(e)[:200])
-            await message.answer(f"{provider}: {voice} failed ({str(e)[:80]})")
-    await message.answer("Pick one in /settings → Voice choice.")
+            await say(message, f"{provider}: {voice} failed ({str(e)[:80]})")
+    await say(message, "Pick one in /settings → Voice choice.")
 
 
 
@@ -2759,7 +2828,7 @@ async def story_send(request):
     if not 0 <= n <= 9999 or not hmac.compare_digest(str(body.get("sig", "")), story_sig(n)):
         return web.json_response({"ok": False, "error": "bad signature"}, status=403)
     try:
-        await send_story_file(request.app["bot"], uid, n)
+        await send_story_file(request.app["bot"], uid, n, main_kw(await get_user(uid)).get("message_thread_id"))
     except Exception:
         log.exception("story_send failed")
         return web.json_response({"ok": False, "error": "could not send"}, status=500)
