@@ -213,7 +213,7 @@ USER_DEFAULTS = {
     "remind_sent": 0, "remind_ts": None, "quiet_from": "23:00", "quiet_to": "09:00",
     "voice_mode": "off", "tts_voice": "gemini:Kore", "weak_on": True, "last_weak": None,
     "stats": {}, "goals": [], "pending_goal": None, "last_hint": None, "last_hint_ts": None,
-    "pending_friend": None, "main_thread": None, "cmd_thread": None,
+    "pending_friend": None, "main_thread": None, "cmd_thread": None, "last_main_ts": None,
 }
 COLUMN_TYPES = {
     "level": "text", "topic": "text", "style": "text", "explain_lang": "text", "tz": "text",
@@ -229,6 +229,7 @@ COLUMN_TYPES = {
     "tts_voice": "text", "weak_on": "boolean", "last_weak": "date", "stats": "jsonb", "goals": "jsonb",
     "pending_goal": "jsonb", "last_hint": "text", "last_hint_ts": "double precision",
     "pending_friend": "jsonb", "main_thread": "bigint", "cmd_thread": "bigint",
+    "last_main_ts": "double precision",
 }
 
 
@@ -342,6 +343,8 @@ WRONG_TOPIC = {
     "other": "Let's chat in Main, open it in the sidebar 👉 (commands live in Commands).",
 }
 CHAT_COMMANDS = {"new", "stop", "hint"}  # allowed inside Main and friend topics; the rest live in Commands
+ANYWHERE_COMMANDS = {"start", "cancel"}  # work in every topic
+CANCEL_HINT = "\n/cancel to stop"
 
 
 async def topic_alive(bot, chat_id: int, thread_id: int) -> bool:
@@ -1591,6 +1594,33 @@ async def send_widget(chat_id: int, html_text: str, caption: str, public_data: s
         return False
 
 
+async def tg_call(method: str, **params) -> dict | None:
+    """Raw Bot API call for methods that aiogram may not know yet. Returns the result or None."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params)
+        data = r.json()
+    except Exception:
+        log.exception("%s failed", method)
+        return None
+    if not data.get("ok"):
+        log.warning("%s refused: %s", method, str(data)[:300])
+        return None
+    return data.get("result") or {}
+
+
+async def use_topic_tabs() -> None:
+    """Shows the topics as tabs above the chat instead of a sidebar (Bot API 10.5, setMySettings)."""
+    me = await tg_call("getMe")
+    if me is None:
+        return
+    log.info("has_topic_sidebar is %s", me.get("has_topic_sidebar"))
+    if me.get("has_topic_sidebar") is False:
+        return
+    if await tg_call("setMySettings", has_topic_sidebar=False) is not None:
+        log.info("Topics switched to tabs")
+
+
 # ---- hints and reminders ----
 HINT_PROMPT = (
     "You help an English learner who went silent in a chat. Suggest 3 short, natural things they could say "
@@ -1648,7 +1678,8 @@ async def nudge_one(bot: Bot, u: dict) -> None:
     now_ts = time.time()
     uid = u["user_id"]
     last_user, last_bot = u.get("last_user_ts"), u.get("last_bot_ts")
-    waiting = bool(last_bot) and (last_user is None or last_user < last_bot)
+    last_main = u.get("last_main_ts") or last_user  # only messages in Main count for Main's hints
+    waiting = bool(last_bot) and (last_main is None or last_main < last_bot)
 
     # 1) hint when he stops answering in an active conversation, then end the conversation
     if u["active"] and u["hints_on"] and waiting:
@@ -1724,9 +1755,11 @@ async def nudge_loop(bot: Bot) -> None:
 
 
 async def mark_user_message(u: dict, friend: dict | None = None) -> None:
-    await upd(u, last_user_ts=time.time(), hint_sent=False, remind_sent=0)
-    if friend:
+    if friend:  # talking to a friend counts as activity, but must not touch Main's silence hints
+        await upd(u, last_user_ts=time.time(), remind_sent=0)
         await upd_friend(friend, last_user_ts=time.time(), hint_sent=False)
+    else:
+        await upd(u, last_user_ts=time.time(), last_main_ts=time.time(), hint_sent=False, remind_sent=0)
 
 
 async def ensure_active(message: Message, u: dict) -> bool:
@@ -1935,7 +1968,7 @@ class TopicMiddleware(BaseMiddleware):
             if topics_on(u):
                 name = (text[1:].split() or [""])[0].split("@")[0].lower()
                 kind, _ = await route(event, u)
-                if not (name == "start" or kind == "cmd" or (kind in ("main", "friend") and name in CHAT_COMMANDS)):
+                if not (name in ANYWHERE_COMMANDS or kind == "cmd" or (kind in ("main", "friend") and name in CHAT_COMMANDS)):
                     await say(event, "Commands live in the Commands topic, open it in the sidebar 👉")
                     return None
         return await handler(event, data)
@@ -1973,6 +2006,7 @@ HELP_TEXT = (
     "/setagoal - practice goals (words, grammar, phrasal verbs)\n"
     "/create - make a friend with their own topic\n"
     "/friends - your friends\n"
+    "/cancel - cancel what I'm waiting for\n"
     "/hint - ideas for what to say next\n"
     "/help - this message"
 )
@@ -2003,6 +2037,15 @@ async def cmd_start(message: Message):
               tid, reply_markup=kb([[("Start a conversation", "go")]]))
     if tid and thread_of(message) != tid:
         await say(message, "Let's chat in Main, open it in the sidebar 👉")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    """Drops whatever the bot is waiting for: typed answers and half-made goals or friends."""
+    u = await get_user(message.from_user.id)
+    waiting = bool(u.get("awaiting") or u.get("pending_goal") or u.get("pending_friend"))
+    await upd(u, awaiting=None, pending_goal=None, pending_friend=None)
+    await say(message, "Cancelled 👌" if waiting else "Nothing to cancel.")
 
 
 @router.message(Command("stop"))
@@ -2129,7 +2172,7 @@ async def cb_topic(call: CallbackQuery):
     await call.answer()
     if value == "own":
         await upd(u, awaiting="topic")
-        await say(call.message, "Type the topic you want to talk about 👇")
+        await say(call.message, "Type the topic you want to talk about 👇" + CANCEL_HINT)
         return
     await upd(u, topic=None if value == "skip" else value)
     await begin_chat(call.message, u)
@@ -2191,7 +2234,7 @@ async def cb_tz(call: CallbackQuery):
     await call.answer()
     if value == "other":
         await upd(u, awaiting="tz")
-        await say(call.message, "Type a time zone like Europe/Berlin or an offset like +3 👇")
+        await say(call.message, "Type a time zone like Europe/Berlin or an offset like +3 👇" + CANCEL_HINT)
         return
     name = parse_tz(value)
     if name:
@@ -2206,7 +2249,7 @@ async def cb_time(call: CallbackQuery):
     await call.answer()
     if value == "other":
         await upd(u, awaiting="time")
-        await say(call.message, "Type the time like 09:30 👇")
+        await say(call.message, "Type the time like 09:30 👇" + CANCEL_HINT)
         return
     hhmm = parse_hhmm(value)
     if hhmm:
@@ -2389,7 +2432,7 @@ def accent_kb():
 
 async def start_friend_create(message, u: dict) -> None:
     await upd(u, awaiting="fr_name", pending_friend={})
-    await say(message, "Let's create a friend. What's their name?")
+    await say(message, "Let's create a friend. What's their name?" + CANCEL_HINT)
 
 
 async def friend_dialog_text(message: Message, u: dict, awaiting: str) -> None:
@@ -2402,7 +2445,7 @@ async def friend_dialog_text(message: Message, u: dict, awaiting: str) -> None:
         pend["name"] = text
         await upd(u, pending_friend=pend, awaiting="fr_about")
         await say(message, f"Who is {html.escape(text)} and what are they like? Their character, how they talk, "
-                           "what they care about. Any words, any language.")
+                           "what they care about. Any words, any language." + CANCEL_HINT)
     elif awaiting == "fr_about":
         if len(text) < 3:
             await say(message, "Tell me a bit more about them.")
@@ -2511,7 +2554,7 @@ async def cb_friend_accent(call: CallbackQuery):
     key = call.data.split(":", 1)[1]
     if key == "other":
         await upd(u, awaiting="fr_accent")
-        await say(call.message, "Type the accent, for example Scottish or Brazilian.")
+        await say(call.message, "Type the accent, for example Scottish or Brazilian." + CANCEL_HINT)
         return
     pend["accent"] = None if key == "none" else key
     await upd(u, pending_friend=pend)
@@ -2530,7 +2573,7 @@ QUIET_OPTIONS = [("22:00-08:00", "22:00", "08:00"), ("23:00-09:00", "23:00", "09
                  ("00:00-10:00", "00:00", "10:00"), ("Off", "00:00", "00:00")]
 GOAL_ASK_TEXT = ("Send me what you want to practice: words, expressions, phrasal verbs, grammar, anything. "
                  "One message, any format. I will not push these words into our chat, I will just notice "
-                 "when you use them on your own.")
+                 "when you use them on your own." + CANCEL_HINT)
 
 
 @router.message(Command("hint"))
@@ -2622,7 +2665,7 @@ async def cb_goal_days(call: CallbackQuery):
         await say(call.message, "Cancelled.")
     elif value == "custom":
         await upd(u, awaiting="goal_days")
-        await say(call.message, "How many days? Type a number from 1 to 365.")
+        await say(call.message, "How many days? Type a number from 1 to 365." + CANCEL_HINT)
     elif value.isdigit():
         await create_goal(call.message, u, int(value))
 
@@ -2857,6 +2900,7 @@ async def on_startup(bot: Bot):
         await bot.set_webhook(f"{BASE_URL}/webhook", secret_token=WEBHOOK_SECRET,
                               drop_pending_updates=True)
         log.info("Webhook set")
+    track(use_topic_tabs())
     track(morning_loop(bot))
     track(nudge_loop(bot))
 
