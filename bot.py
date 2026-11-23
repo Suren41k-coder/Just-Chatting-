@@ -2020,8 +2020,63 @@ ADMIN_HELP = (
 )
 
 
-@router.message(Command("start", "new"))
+GREETINGS = {
+    "morning": ["Good morning, {name}! ☀️", "Morning, {name}! Ready to talk?", "Hey {name}, fresh day, fresh words ☀️"],
+    "day": ["Hey {name}! 👋", "Hi {name}, nice to see you!", "Welcome back, {name}!"],
+    "evening": ["Good evening, {name}! 🌆", "Evening, {name}! How was your day?",
+                "Hey {name}, let's wind down with some English 🌆"],
+    "night": ["Late one, {name}? 🌙", "Hey {name}, still up? 🌙", "Night owl mode on, {name} 🦉"],
+}
+HOW_TEXT = (
+    "How it works\n\n"
+    "💬 Main is our conversation. Talk by voice or text, I answer and point out mistakes.\n"
+    "💡 A tip appears when a phrase can sound more natural.\n"
+    "👥 Friends: /create a friend with a character and a voice. Each lives in their own topic "
+    "with a separate history.\n"
+    "🔊 Voice replies: turn them on in /settings (Commands topic).\n"
+    "🎯 /setagoal to practice words and grammar, /stats for your progress.\n"
+    "🆕 /new starts over, /hint helps when you're stuck, /cancel stops a question I'm waiting on."
+)
+
+
+def welcome_text(user, u: dict) -> str:
+    now = local_now(u)
+    part = ("morning" if 5 <= now.hour < 11 else "day" if now.hour < 17
+            else "evening" if now.hour < 22 else "night")
+    text = random.choice(GREETINGS[part]).format(name=html.escape(user.first_name or "there"))
+    if u["streak"] > 0 and u["last_day"] is not None and (now.date() - u["last_day"]).days <= 1:
+        text += f"\n🔥 Day {u['streak']} of your streak."
+    return (text + "\n\nTalk to me by voice or text. I'll gently point out mistakes and drop a 💡 when a phrase "
+            "can sound better.\nSettings, goals and stats live in the Commands topic.")
+
+
+async def new_conversation(message, u: dict) -> None:
+    await reset_chat(u)
+    tid = u["main_thread"] if topics_on(u) else None
+    await say(message, "Fresh start 🧼 What's your level? You can skip this, I'll adapt as we chat.",
+              tid, reply_markup=level_kb())
+    if tid and thread_of(message) != tid:
+        await say(message, "Let's chat in Main, open it in the sidebar 👉")
+
+
+@router.message(Command("start"))
 async def cmd_start(message: Message):
+    u = await get_user(message.from_user.id)
+    kind, friend = await route(message, u)
+    if friend:
+        await say(message, f"You're chatting with {html.escape(friend['name'])}. Send /new to clear this chat.")
+        return
+    await ensure_topics(message.bot, u)  # makes the topics, keeps the conversation
+    tid = u["main_thread"] if topics_on(u) else None
+    first = ("💬 Continue chatting", "st:cont") if u["history"] else ("Start a conversation", "go")
+    await say(message, welcome_text(message.from_user, u), tid, reply_markup=kb([
+        [first], [("🆕 New conversation", "st:new"), ("👥 Make a friend", "st:friend")], [("❓ How it works", "st:how")]]))
+    if tid and thread_of(message) != tid:
+        await say(message, "Let's chat in Main, open it in the sidebar 👉")
+
+
+@router.message(Command("new"))
+async def cmd_new(message: Message):
     u = await get_user(message.from_user.id)
     kind, friend = await route(message, u)
     if friend:  # inside a friend's topic: just clear that conversation
@@ -2029,14 +2084,27 @@ async def cmd_start(message: Message):
         await say(message, "Fresh start 👋")
         return
     await ensure_topics(message.bot, u)
-    await reset_chat(u)
-    tid = u["main_thread"] if topics_on(u) else None
-    await say(message,
-              "Hey! 👋 I'm here to help you practice English. Just chat with me, "
-              "and I'll gently point out mistakes.",
-              tid, reply_markup=kb([[("Start a conversation", "go")]]))
-    if tid and thread_of(message) != tid:
-        await say(message, "Let's chat in Main, open it in the sidebar 👉")
+    await new_conversation(message, u)
+
+
+@router.callback_query(F.data.startswith("st:"))
+async def cb_start_menu(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    await call.answer()
+    action = call.data.split(":", 1)[1]
+    if action == "cont":
+        await upd(u, active=True)
+        await say(call.message, "Go on, I'm listening 👂")
+    elif action == "new":
+        await new_conversation(call.message, u)
+    elif action == "friend":
+        if topics_on(u):
+            await start_friend_create(call.message, u, u["cmd_thread"])
+            await say(call.message, "Let's make a friend in Commands, open it in the sidebar 👉")
+        else:
+            await start_friend_create(call.message, u)
+    elif action == "how":
+        await say(call.message, HOW_TEXT)
 
 
 @router.message(Command("cancel"))
@@ -2430,9 +2498,9 @@ def accent_kb():
                [("French", "fa:French"), ("✍️ Other", "fa:other")]])
 
 
-async def start_friend_create(message, u: dict) -> None:
+async def start_friend_create(message, u: dict, thread_id: int | None = None) -> None:
     await upd(u, awaiting="fr_name", pending_friend={})
-    await say(message, "Let's create a friend. What's their name?" + CANCEL_HINT)
+    await say(message, "Let's create a friend. What's their name?" + CANCEL_HINT, thread_id)
 
 
 async def friend_dialog_text(message: Message, u: dict, awaiting: str) -> None:
