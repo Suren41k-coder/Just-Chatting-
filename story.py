@@ -11,6 +11,7 @@ The cache is automatically refreshed when the flame or font file changes.
 """
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -23,7 +24,7 @@ W, H = 720, 1280
 FPS = 24
 MIN_SECONDS = 3
 FLAME_WIDTH = 560
-FLAME_CENTER_Y = 360
+FLAME_CENTER_Y = 500
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(HERE, "assets")
@@ -184,10 +185,10 @@ def _text_layer(n: int) -> Image.Image:
     draw = ImageDraw.Draw(layer)
 
     digits = len(str(n))
-    size = {1: 420, 2: 380, 3: 300}.get(digits, 260)
+    size = {1: 520, 2: 440, 3: 340}.get(digits, 260)
     num_font = _font(size)
 
-    cx, cy = W // 2, 860
+    cx, cy = W // 2, FLAME_CENTER_Y + 40
     draw.text(
         (cx + 6, cy + 10), str(n), font=num_font,
         fill=(90, 10, 20, 90), anchor="mm",
@@ -198,8 +199,8 @@ def _text_layer(n: int) -> Image.Image:
     )
 
     label = "day in a row" if n == 1 else "days in a row"
-    label_font = _font(52)
-    ly = 1090
+    label_font = _font(78)
+    ly = int(H * 0.70)
 
     draw.text(
         (cx + 3, ly + 4), label, font=label_font,
@@ -316,6 +317,24 @@ def story_path(n: int):
     return None
 
 
+KEEP_FILES = 3  # only the newest story files stay on the disk
+
+
+def _prune(keep: int = KEEP_FILES) -> None:
+    """Deletes the older story files so the cache cannot grow without limit."""
+    try:
+        files = [os.path.join(OUT_DIR, f) for f in os.listdir(OUT_DIR) if re.fullmatch(r"story_\d+\.(mp4|png)", f)]
+        files.sort(key=os.path.getmtime, reverse=True)
+        for path in files[keep:]:
+            for old in (path, path + ".meta"):
+                try:
+                    os.remove(old)
+                except FileNotFoundError:
+                    pass
+    except OSError:
+        log.warning("Could not prune the story cache")
+
+
 def ensure_story(n: int):
     """
     Renders (or finds in the cache) the story for streak n.
@@ -356,10 +375,12 @@ def ensure_story(n: int):
             out = os.path.join(OUT_DIR, f"story_{n}.mp4")
             if _render_mp4(n, frames, durations, out):
                 _write_cache_signature(out, signature)
+                _prune()
                 return out, "mp4"
             log.warning("Video rendering failed, falling back to a picture")
 
         out = os.path.join(OUT_DIR, f"story_{n}.png")
         _render_png(n, frames[0], out)
         _write_cache_signature(out, signature)
+        _prune()
         return out, "png"

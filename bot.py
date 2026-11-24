@@ -1007,13 +1007,6 @@ def story_url(n: int) -> str:
     return f"{BASE_URL}/story?n={n}&sig={story_sig(n)}"
 
 
-async def prepare_story(n: int) -> None:
-    try:
-        await asyncio.to_thread(story.ensure_story, n)
-    except Exception:
-        log.exception("story preparation failed")
-
-
 def kb(rows: list[list[tuple]]) -> InlineKeyboardMarkup:
     """Rows of (text, callback_data) or (text, callback_data, style); style: success=green, danger=red, primary=blue."""
     def button(t, d, style=None):
@@ -1075,7 +1068,6 @@ async def count_day(bot: Bot, u: dict, today: date) -> bool:
     new = u["streak"] + 1 if prev_last == today - timedelta(days=1) else 1
     await upd(u, streak=new, best_streak=max(u["best_streak"], new), last_day=today,
               prev_streak=prev_streak, prev_last_day=prev_last, blocked_day=None)
-    track(prepare_story(new))  # render the story picture in advance
     await announce_day(bot, u, new)
     return True
 
@@ -1938,6 +1930,10 @@ def settings_kb(u: dict):
 
 
 # ---- handlers ----
+stranger_notice: dict[int, float] = {}  # when a person without access was last told "private bot"
+STRANGER_PAUSE = 600
+
+
 class AccessMiddleware(BaseMiddleware):
     """Only the admin and the people the admin allowed can use the bot."""
 
@@ -1950,10 +1946,15 @@ class AccessMiddleware(BaseMiddleware):
             return None  # service messages are not from a person
         if user is None or user.id == ADMIN_ID or user.id in allowed:
             return await handler(event, data)
+        now_ts = time.time()
+        told_recently = now_ts - stranger_notice.get(user.id, 0) < STRANGER_PAUSE
+        if not told_recently:
+            stranger_notice[user.id] = now_ts
         if isinstance(event, Message):
-            await event.answer("This is a private bot.")
+            if not told_recently:  # no reply to every message, a stranger could make the bot spam
+                await event.answer("This is a private bot.")
         elif isinstance(event, CallbackQuery):
-            await event.answer("This is a private bot.", show_alert=True)
+            await event.answer(None if told_recently else "This is a private bot.", show_alert=not told_recently)
         return None
 
 
@@ -2203,7 +2204,6 @@ async def cmd_setstreak(message: Message, command: CommandObject):
               prev_streak=max(n - 1, 0), prev_last_day=(today - timedelta(days=1)) if n > 1 else None,
               blocked_day=None)
     if n > 0:
-        track(prepare_story(n))
         await announce_day(message.bot, u, n)
     else:
         await unpin_old(message.bot, u)
@@ -2211,32 +2211,65 @@ async def cmd_setstreak(message: Message, command: CommandObject):
 
 
 # ---- callbacks ----
+ALREADY_CHATTING = "We're already chatting 🙂"
+starting: set[int] = set()  # people whose conversation is being started right now
+
+
+async def drop_keyboard(call: CallbackQuery) -> None:
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass  # the message is old or already changed, no problem
+
+
 @router.callback_query(F.data == "go")
 async def cb_go(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    await drop_keyboard(call)
+    if u["active"]:
+        await call.answer(ALREADY_CHATTING)
+        return
     await say(call.message, "What's your level? You can skip this, I'll adapt as we chat.",
-                              reply_markup=level_kb())
+              reply_markup=level_kb())
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("lvl:"))
 async def cb_level(call: CallbackQuery):
     u = await get_user(call.from_user.id)
+    await drop_keyboard(call)
+    if u["active"]:
+        await call.answer(ALREADY_CHATTING)
+        return
     value = call.data.split(":", 1)[1]
     await upd(u, level=value if value in LEVELS else None)
     await say(call.message, "Pick a topic, write your own, or skip.", reply_markup=topic_kb())
     await call.answer()
 
 
-async def begin_chat(message: Message, u: dict):
-    await upd(u, active=True, awaiting=None)
-    await safe_ai(message, u, "Start the conversation with a short, natural opener.",
-                  save_user_text=False)
+async def begin_chat(message: Message, u: dict) -> bool:
+    """Starts the conversation once: a second tap on an old button must not start another one."""
+    uid = u["user_id"]
+    if u["active"] or uid in starting:
+        return False
+    starting.add(uid)
+    try:
+        await upd(u, active=True, awaiting=None)
+        await safe_ai(message, u, "Start the conversation with a short, natural opener.",
+                      save_user_text=False)
+    finally:
+        starting.discard(uid)
+    return True
 
 
 @router.callback_query(F.data.startswith("top:"))
 async def cb_topic(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     value = call.data.split(":", 1)[1]
+    await drop_keyboard(call)
+    if u["active"] or u["user_id"] in starting:
+        await call.answer(ALREADY_CHATTING)
+        return
     await call.answer()
     if value == "own":
         await upd(u, awaiting="topic")
