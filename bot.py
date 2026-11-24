@@ -2051,6 +2051,12 @@ def welcome_text(user, u: dict) -> str:
             "can sound better.\nSettings, goals and stats live in the Commands topic.")
 
 
+async def ask_restart(message) -> None:
+    await say(message, "You're in the middle of a conversation. Start over? This clears our chat. "
+                       "(/stop just ends it.)",
+              reply_markup=kb([[("🆕 Yes, start over", "nw:yes", "danger"), ("💬 Keep chatting", "nw:no", "success")]]))
+
+
 async def new_conversation(message, u: dict) -> None:
     await reset_chat(u)
     tid = u["main_thread"] if topics_on(u) else None
@@ -2070,7 +2076,11 @@ async def cmd_start(message: Message):
     await ensure_topics(message.bot, u)  # makes the topics, keeps the conversation
     tid = u["main_thread"] if topics_on(u) else None
     first = ("💬 Continue chatting", "st:cont") if u["history"] else ("Start a conversation", "go")
-    await say(message, welcome_text(message.from_user, u), tid, reply_markup=kb([
+    text = welcome_text(message.from_user, u)
+    if u["active"]:
+        text = ("We're already chatting 🙂 To end this conversation send /stop, to start over send /new.\n\n"
+                + text)
+    await say(message, text, tid, reply_markup=kb([
         [first], [("🆕 New conversation", "st:new"), ("👥 Make a friend", "st:friend")], [("❓ How it works", "st:how")]]))
     if tid and thread_of(message) != tid:
         await say(message, "Let's chat in Main, open it in the sidebar 👉")
@@ -2085,7 +2095,21 @@ async def cmd_new(message: Message):
         await say(message, "Fresh start 👋")
         return
     await ensure_topics(message.bot, u)
+    if u["active"]:  # a running conversation is never wiped without asking
+        await ask_restart(message)
+        return
     await new_conversation(message, u)
+
+
+@router.callback_query(F.data.startswith("nw:"))
+async def cb_new_confirm(call: CallbackQuery):
+    u = await get_user(call.from_user.id)
+    await drop_keyboard(call)
+    await call.answer()
+    if call.data == "nw:yes":
+        await new_conversation(call.message, u)
+    else:
+        await say(call.message, "Okay, let's keep chatting 🙂")
 
 
 @router.callback_query(F.data.startswith("st:"))
@@ -2097,7 +2121,10 @@ async def cb_start_menu(call: CallbackQuery):
         await upd(u, active=True)
         await say(call.message, "Go on, I'm listening 👂")
     elif action == "new":
-        await new_conversation(call.message, u)
+        if u["active"]:
+            await ask_restart(call.message)
+        else:
+            await new_conversation(call.message, u)
     elif action == "friend":
         if topics_on(u):
             await start_friend_create(call.message, u, u["cmd_thread"])
@@ -2227,7 +2254,7 @@ async def cb_go(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     await drop_keyboard(call)
     if u["active"]:
-        await call.answer(ALREADY_CHATTING)
+        await call.answer(ALREADY_CHATTING, show_alert=True)
         return
     await say(call.message, "What's your level? You can skip this, I'll adapt as we chat.",
               reply_markup=level_kb())
@@ -2239,7 +2266,7 @@ async def cb_level(call: CallbackQuery):
     u = await get_user(call.from_user.id)
     await drop_keyboard(call)
     if u["active"]:
-        await call.answer(ALREADY_CHATTING)
+        await call.answer(ALREADY_CHATTING, show_alert=True)
         return
     value = call.data.split(":", 1)[1]
     await upd(u, level=value if value in LEVELS else None)
@@ -2268,7 +2295,7 @@ async def cb_topic(call: CallbackQuery):
     value = call.data.split(":", 1)[1]
     await drop_keyboard(call)
     if u["active"] or u["user_id"] in starting:
-        await call.answer(ALREADY_CHATTING)
+        await call.answer(ALREADY_CHATTING, show_alert=True)
         return
     await call.answer()
     if value == "own":
