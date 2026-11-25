@@ -1,15 +1,3 @@
-"""Just Chatting (ENG): a private English speaking-practice bot for Telegram.
-
-CODE MAP (search for these section titles):
-  settings ........ environment variables and constants
-  styles/prompt ... chat styles and the rules sent to the AI
-  storage ......... Postgres (Supabase) with an in-memory fallback
-  streak .......... streak counting, pinning, morning message
-  ai .............. Gemini (main) and Groq (fallback), answer parsing and filters
-  voice ........... Gemini (main) and Groq Whisper (fallback)
-  handlers ........ commands, settings menu, messages
-  web server ...... webhook, health check, story page
-"""
 import asyncio
 import base64
 import hashlib
@@ -42,7 +30,6 @@ import story
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ---- settings (all secrets come from environment variables) ----
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
@@ -58,13 +45,13 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me-please-123")
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 MAX_VOICE_SECONDS = 60
-COOLDOWN_SECONDS = 5  # only for people the admin allowed, not for the admin
-HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "30"))  # messages (user + bot)
+COOLDOWN_SECONDS = 5
+HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "30"))
 MAX_TOKENS = 1500
-AI_ATTEMPTS = 2  # attempts per AI provider
+AI_ATTEMPTS = 2
 RETRY_STATUSES = {400, 408, 422, 500, 502, 503, 504}
-STREAK_MESSAGES = 3  # messages needed to count a day
-MORNING_WINDOW_HOURS = 6  # a late morning message is skipped after this long
+STREAK_MESSAGES = 3
+MORNING_WINDOW_HOURS = 6
 
 LEVELS = {"a": "A1-A2 (beginner)", "b": "B1-B2 (intermediate)", "c": "C1-C2 (advanced)"}
 TOPICS = ["Games", "Sport", "Music", "Movies", "Travel", "Food"]
@@ -81,14 +68,13 @@ MORNING_TIMES = [["07:00", "08:00", "09:00"], ["10:00", "11:00", "12:00"]]
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
 GEMINI_TTS_LEGACY_MODEL = os.environ.get("GEMINI_TTS_LEGACY_MODEL", "gemini-3.1-flash-tts-preview")
 STATS_KEEP_DAYS = 200
-GOAL_REPORT_HOUR = 21  # local hour of the final goal report on the last day
+GOAL_REPORT_HOUR = 21
 NUDGE_TICK_SECONDS = 30
 GEMINI_VOICES = ["Kore", "Puck", "Charon", "Aoede"]
 EDGE_VOICES = ["en-US-AvaNeural", "en-US-AndrewNeural", "en-US-AriaNeural", "en-US-GuyNeural"]
 VOICE_SAMPLE = "Hey, it's good to hear from you. So, what did you get up to today?"
 VOICE_MODE_LABELS = {"off": "off", "button": "button", "always": "always"}
 
-# ---- chat styles: key -> (button label, instruction for the AI) ----
 FILLER_TEXT = (
     " Filler words (kinda, sorta, you know, I mean, like, uh, well) are allowed ONLY when you are "
     "genuinely thrown off: the conversation gets confusing, you don't know how to answer, or the topic "
@@ -194,10 +180,9 @@ MISTAKE_RULES = (
 )
 
 
-# ---- storage: Postgres (Supabase) with an in-memory fallback ----
-pool = None  # asyncpg pool, stays None when there is no database
+pool = None
 mem_users: dict[int, dict] = {}
-allowed: set[int] = set()  # people the admin gave access to
+allowed: set[int] = set()
 background_tasks: set = set()
 
 USER_DEFAULTS = {
@@ -207,7 +192,6 @@ USER_DEFAULTS = {
     "streak": 0, "best_streak": 0, "last_day": None, "prev_streak": 0, "prev_last_day": None,
     "blocked_day": None, "today_date": None, "today_count": 0, "last_morning": None,
     "pinned_msg_id": None, "history": [], "active": False, "awaiting": None,
-    # stage 4
     "hints_on": True, "hint_min": 5, "hint_sent": False, "hint_ts": None, "silence_end": False,
     "last_user_ts": None, "last_bot_ts": None, "remind_on": True, "remind1_h": 2, "remind2_h": 24,
     "remind_sent": 0, "remind_ts": None, "quiet_from": "23:00", "quiet_to": "09:00",
@@ -234,15 +218,12 @@ COLUMN_TYPES = {
 
 
 def track(coro) -> None:
-    """Runs a coroutine in the background and keeps a reference so it is not garbage collected."""
     task = asyncio.create_task(coro)
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
 
 
-# ---- topics and friends ----
 class Typing:
-    """Keeps a chat action (typing / record_voice) alive in a chat or topic while the block runs."""
 
     def __init__(self, bot, chat_id: int, action: str = "typing", thread_id: int | None = None):
         self.bot, self.chat_id, self.action, self.thread_id = bot, chat_id, action, thread_id
@@ -255,7 +236,7 @@ class Typing:
                 await self.bot.send_chat_action(self.chat_id, self.action, **kw)
             except Exception:
                 pass
-            await asyncio.sleep(4.5)  # Telegram shows an action for about 5 seconds
+            await asyncio.sleep(4.5)
 
     async def __aenter__(self):
         self.task = asyncio.create_task(self._loop())
@@ -275,14 +256,13 @@ def thread_of(message) -> int | None:
 
 
 async def say(message, text: str, thread_id: int | None = None, **kw):
-    """Sends text to the chat of `message`, into the same topic (or the given one)."""
     tid = thread_id if thread_id is not None else thread_of(message)
     if tid:
         kw["message_thread_id"] = tid
     return await message.bot.send_message(message.chat.id, text, **kw)
 
 
-mem_friends: dict[int, dict] = {}  # used when there is no database
+mem_friends: dict[int, dict] = {}
 mem_friend_seq = 0
 
 
@@ -316,17 +296,14 @@ async def friend_here(message) -> dict | None:
 
 
 def topics_on(u: dict) -> bool:
-    """The Main and Commands topics exist (made by /start)."""
     return bool(u.get("main_thread") and u.get("cmd_thread"))
 
 
 def main_kw(u: dict) -> dict:
-    """Where the bot writes by itself (streak, morning message, reminders, hints): the Main topic."""
     return {"message_thread_id": u["main_thread"]} if topics_on(u) else {}
 
 
 async def route(message, u: dict) -> tuple[str, dict | None]:
-    """Which chat a message belongs to: 'friend', 'main', 'cmd' (Commands topic) or 'other' (any stray topic)."""
     tid = thread_of(message)
     friend = await friend_by_thread(u["user_id"], tid)
     if friend:
@@ -342,8 +319,8 @@ WRONG_TOPIC = {
     "cmd": "This topic is for commands. Let's chat in Main, open it in the sidebar 👉",
     "other": "Let's chat in Main, open it in the sidebar 👉 (commands live in Commands).",
 }
-CHAT_COMMANDS = {"new", "stop", "hint"}  # allowed inside Main and friend topics; the rest live in Commands
-ANYWHERE_COMMANDS = {"start", "cancel"}  # work in every topic
+CHAT_COMMANDS = {"new", "stop", "hint"}
+ANYWHERE_COMMANDS = {"start", "cancel"}
 CANCEL_HINT = "\n/cancel to stop"
 
 
@@ -352,11 +329,10 @@ async def topic_alive(bot, chat_id: int, thread_id: int) -> bool:
         await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
         return True
     except Exception as e:
-        return "thread" not in str(e).lower()  # only a missing topic counts, not a network hiccup
+        return "thread" not in str(e).lower()
 
 
 async def ensure_topics(bot, u: dict) -> None:
-    """Creates the Main and Commands topics (or makes them again if one was deleted)."""
     for field, name in (("main_thread", "Main"), ("cmd_thread", "Commands")):
         if u.get(field) and not await topic_alive(bot, u["user_id"], u[field]):
             await upd(u, **{field: None})
@@ -434,7 +410,7 @@ async def init_db() -> None:
             for col, typ in (("last_user_ts", "double precision"), ("last_bot_ts", "double precision"),
                              ("hint_sent", "boolean"), ("hint_ts", "double precision")):
                 await conn.execute(f"ALTER TABLE friends ADD COLUMN IF NOT EXISTS {col} {typ}")
-            for table in ("users", "allowed", "friends"):  # keep the Supabase API closed for every table
+            for table in ("users", "allowed", "friends"):
                 try:
                     await conn.execute(f"ALTER TABLE public.{table} ENABLE ROW LEVEL SECURITY")
                 except Exception:
@@ -512,7 +488,6 @@ async def set_allowed(uid: int, on: bool) -> None:
         log.exception("set_allowed failed")
 
 
-# ---- time helpers ----
 def get_tz(u: dict) -> ZoneInfo:
     try:
         return ZoneInfo(u["tz"])
@@ -529,7 +504,6 @@ def local_today(u: dict) -> date:
 
 
 def parse_tz(text: str) -> str | None:
-    """Accepts a name like Europe/Berlin or an offset like +3, UTC+3, -5."""
     text = text.strip()
     m = re.fullmatch(r"(?:utc|gmt)?\s*([+-]?)(\d{1,2})", text, re.I)
     if m:
@@ -539,7 +513,7 @@ def parse_tz(text: str) -> str | None:
         if hours == 0:
             return "UTC"
         sign = m.group(1) or "+"
-        name = f"Etc/GMT{'-' if sign == '+' else '+'}{hours}"  # Etc zones have an inverted sign
+        name = f"Etc/GMT{'-' if sign == '+' else '+'}{hours}"
     else:
         name = text
     try:
@@ -567,7 +541,6 @@ def parse_hhmm(text: str) -> str | None:
 
 
 async def reset_chat(u: dict) -> None:
-    # style and settings stay between conversations
     await upd(u, level=None, topic=None, history=[], awaiting=None, active=False,
               hint_sent=False, silence_end=False, pending_goal=None, pending_friend=None)
 
@@ -631,7 +604,6 @@ TRIVIAL_WORDS = ("запят", "comma", "пунктуац", "punctuat", "заг�
 
 
 def clean_reply(text) -> str:
-    """Remove JSON debris that sometimes leaks into the reply text."""
     text = str(text)
     text = re.sub(r'[\s,"]*"mistakes"\s*:.*$', "", text, flags=re.S)
     text = re.sub(r'^\s*\{?\s*"reply"\s*:\s*"', "", text)
@@ -652,7 +624,6 @@ def norm_text(text) -> str:
 
 
 def tip_in_text(tip: str, user_text: str) -> bool:
-    """A tip like 'Не хватает a: a new game' is wrong if the user already wrote that phrase."""
     if ":" not in tip:
         return False
     phrase = norm_text(tip.split(":", 1)[1])
@@ -668,8 +639,6 @@ def content_words(text) -> set[str]:
 
 
 def tip_repeats_old(tip: str, user_text: str, history: list) -> bool:
-    """A tip that has nothing to do with the current message but matches an earlier message of this
-    chat is an old tip coming back."""
     if ":" not in tip:
         return False
     words = content_words(tip.split(":", 1)[1])
@@ -680,7 +649,6 @@ def tip_repeats_old(tip: str, user_text: str, history: list) -> bool:
 
 
 def tip_same_sides(tip: str) -> bool:
-    """Drop pointless tips like 'to the shop → to the shop'."""
     for arrow in ("→", "->", "=>"):
         if arrow in tip:
             left, right = tip.split(arrow, 1)
@@ -705,7 +673,6 @@ def is_trivial(m: dict) -> bool:
     expl = str(m.get("explanation", "")).lower()
     if has_trivial_words(expl):
         return True
-    # "it's going amazing", "I feel great": an adjective after these verbs is normal speech
     if ("наречи" in expl or "adverb" in expl) and CASUAL_ADVERB_VERBS.search(str(m.get("quote", ""))):
         return True
     return False
@@ -736,7 +703,6 @@ def parse_ai(content: str) -> dict:
 
 
 def salvage(response: httpx.Response) -> dict | None:
-    """Groq answers 400 when the model's JSON is broken, but includes what it wrote. Try to use it."""
     try:
         text = response.json()["error"]["failed_generation"]
     except Exception:
@@ -753,8 +719,6 @@ def salvage(response: httpx.Response) -> dict | None:
     return None
 
 
-
-# ---- ai: Gemini first, Groq as a fallback ----
 async def call_gemini(system: str, history: list[dict], user_text: str) -> str:
     contents: list[dict] = []
 
@@ -773,7 +737,6 @@ async def call_gemini(system: str, history: list[dict], user_text: str) -> str:
     payload = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": contents,
-        # no temperature: Gemini 3.x models do not accept sampling parameters
         "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": MAX_TOKENS},
     }
     async with httpx.AsyncClient(timeout=40) as client:
@@ -815,7 +778,6 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True, friend: d
         style_text = f"Stay fully in character as {friend['name']}: {friend['about'][:300]}"
     else:
         style_text = STYLES.get(u.get("style"), STYLES[DEFAULT_STYLE])[1]
-    # the reminder keeps the style strong even when earlier replies were written in another style
     final_user = f"{user_text}\n\n[Reply in this style (do not mention this note): {style_text}]"
 
     providers = []
@@ -843,7 +805,7 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True, friend: d
                     if result:
                         break
                 if code not in RETRY_STATUSES or (code == 400 and name == "gemini"):
-                    break  # retrying will not help, try the next provider
+                    break
             except (httpx.HTTPError, TimeoutError):
                 last_code = "503"
                 log.exception("%s network error", name)
@@ -862,7 +824,6 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True, friend: d
     result["tips"] = [t for t in result.get("tips", [])
                       if not tip_in_text(t, user_text) and not tip_same_sides(t)
                       and not tip_repeats_old(t, user_text, history)]
-    # a mistake must quote words from this very message, otherwise the model is repeating an old one
     result["mistakes"] = [m for m in result.get("mistakes", [])
                           if norm_text(m["quote"]) and norm_text(m["quote"]) in norm_text(user_text)]
 
@@ -877,7 +838,6 @@ async def ask_ai(u: dict, user_text: str, save_user_text: bool = True, friend: d
     return result
 
 
-# ---- voice: Gemini first, Groq Whisper as a fallback ----
 VOICE_PROMPT = (
     "Transcribe the speech in this audio exactly as spoken, word for word, in the language spoken. "
     "Keep grammar mistakes, slang and informal forms (wanna, gonna, ain't) exactly as said. "
@@ -944,7 +904,6 @@ async def transcribe(audio: bytes) -> str:
     raise AIError(last_code)
 
 
-# ---- sending answers ----
 async def send_ai_result(message: Message, u: dict, result: dict, friend: dict | None = None,
                          thread_id: int | None = None) -> None:
     tid = thread_id if thread_id is not None else thread_of(message)
@@ -952,7 +911,7 @@ async def send_ai_result(message: Message, u: dict, result: dict, friend: dict |
     voice_sent = False
     if u["voice_mode"] == "always":
         voice_sent = await send_voice_reply(message.bot, u, message.chat.id, result["reply"], friend, tid)
-    if not voice_sent:  # text goes out unless the voice reply was sent (or voice failed)
+    if not voice_sent:
         reply = html.escape(result["reply"])
         if not mistakes and u["emoji"]:
             reply += " " + random.choice(PRAISE)
@@ -961,7 +920,7 @@ async def send_ai_result(message: Message, u: dict, result: dict, friend: dict |
 
     if mistakes:
         blocks = []
-        per_mistake = 2 if len(mistakes) == 1 else 1  # keep it short when there are several
+        per_mistake = 2 if len(mistakes) == 1 else 1
         for m in mistakes:
             block = f"<blockquote>{html.escape(str(m['quote']))}</blockquote>\n"
             block += html.escape(str(m.get("explanation", "")))
@@ -974,7 +933,7 @@ async def send_ai_result(message: Message, u: dict, result: dict, friend: dict |
     tips = result.get("tips") or []
     if tips and u["tips_on"]:
         await say(message, "\n".join(f"💡 <i>{html.escape(t)}</i>" for t in tips), tid)
-    if friend:  # a friend's silence is tracked separately from the main chat
+    if friend:
         await upd_friend(friend, last_bot_ts=time.time(), hint_sent=False)
     else:
         await upd(u, last_bot_ts=time.time(), hint_sent=False)
@@ -994,7 +953,6 @@ async def safe_ai(message: Message, u: dict, text: str, save_user_text: bool = T
     return result
 
 
-# ---- streak ----
 def fire(u: dict) -> str:
     return " 🔥" if u["emoji"] else ""
 
@@ -1008,7 +966,6 @@ def story_url(n: int) -> str:
 
 
 def kb(rows: list[list[tuple]]) -> InlineKeyboardMarkup:
-    """Rows of (text, callback_data) or (text, callback_data, style); style: success=green, danger=red, primary=blue."""
     def button(t, d, style=None):
         extra = {"style": style} if style else {}
         return InlineKeyboardButton(text=t, callback_data=d, **extra)
@@ -1028,7 +985,6 @@ def streak_kb(n: int, counted: bool) -> InlineKeyboardMarkup:
 
 
 async def send_story_file(bot: Bot, chat_id: int, n: int, thread_id: int | None = None) -> None:
-    """Sends the rendered story to the chat, so it can be posted as a story by hand."""
     path, kind = await asyncio.to_thread(story.ensure_story, n)
     caption = f"{n} {'day' if n == 1 else 'days'} in a row. Save it and post it as a story."
     kw = {"message_thread_id": thread_id} if thread_id else {}
@@ -1098,13 +1054,13 @@ async def morning_one(bot: Bot, u: dict) -> None:
     target = datetime.combine(today, dtime(hh, mm), tzinfo=get_tz(u))
     if now < target or now > target + timedelta(hours=MORNING_WINDOW_HOURS):
         return
-    await upd(u, last_morning=today)  # mark first, so a failure does not repeat every minute
+    await upd(u, last_morning=today)
     if u["streak"] > 0 and u["last_day"] is not None and (today - u["last_day"]).days >= 2:
         await unpin_old(bot, u)
         await upd(u, streak=0)
         text = "Your streak reset to 0. No stress, today is a fresh start. Ready to chat?"
     elif u["last_day"] == today:
-        return  # already counted today
+        return
     elif u["streak"] > 0:
         text = f"Day {u['streak']}{fire(u)} Ready to chat?"
     else:
@@ -1129,9 +1085,6 @@ async def morning_loop(bot: Bot) -> None:
         await asyncio.sleep(60)
 
 
-# =====================================================================
-# stage 4: stats, weak spots, goals, hints, reminders, voice replies
-# =====================================================================
 CATEGORY_NAMES = {"a": "articles", "t": "tenses", "p": "prepositions", "w": "word order",
                   "v": "verb forms", "s": "spelling", "c": "word choice", "o": "other"}
 
@@ -1151,7 +1104,6 @@ def categorize(text) -> str:
     return "o"
 
 
-# ---- generic "ask the AI for JSON" helper (used by goals, hints, nudges) ----
 def ai_providers():
     out = []
     if GEMINI_API_KEY:
@@ -1195,7 +1147,6 @@ async def all_users() -> list[dict]:
         return []
 
 
-# ---- statistics ----
 def day_key(u: dict) -> str:
     return local_today(u).isoformat()
 
@@ -1261,7 +1212,6 @@ def weak_note(u: dict) -> str | None:
     return f"Lately your most common slip: {CATEGORY_NAMES[code]} ({n} times). Keep an eye on it today."
 
 
-# ---- goals ----
 def item_attempts(it: dict) -> int:
     return it["c"] + it["w"]
 
@@ -1338,7 +1288,6 @@ def goal_report(g: dict) -> list[str]:
     prompted = sum(i["p"] for i in g["items"])
     if prompted:
         parts.append(f"Uses after my hints (not counted): {prompted}")
-    # split into messages under the Telegram limit, only between lines (tags stay balanced)
     msgs, cur = [], ""
     for ln in "\n\n".join(parts).split("\n"):
         if len(cur) + len(ln) + 1 > 3800 and cur:
@@ -1404,14 +1353,14 @@ async def track_goals(uid: int, text: str, prev_bot: str) -> None:
         flat = [(g["id"], it["id"], it["t"], it["k"]) for g in goals for it in g["items"]]
         hint = u.get("last_hint") or ""
         if time.time() - (u.get("last_hint_ts") or 0) > 900:
-            hint = ""  # an old hint is no longer in the learner's head
+            hint = ""
         payload = {"learner_message": text[:600], "partner_previous_message": prev_bot[:600],
                    "hint_shown_to_learner": hint[:300],
                    "items": [{"id": i, "item": t, "kind": k} for i, (_, _, t, k) in enumerate(flat)]}
         data = await ai_json(ASSESS_PROMPT, json.dumps(payload, ensure_ascii=False))
         if not data or not isinstance(data.get("results"), list):
             return
-        fresh = await get_user(uid)  # the goals may have changed while the AI was thinking
+        fresh = await get_user(uid)
         h = hashlib.md5(norm_text(text).encode()).hexdigest()[:10]
         changed = False
         for r in data["results"]:
@@ -1425,7 +1374,7 @@ async def track_goals(uid: int, text: str, prev_bot: str) -> None:
             g = next((x for x in fresh["goals"] if x["id"] == gid and not x.get("done")), None)
             it = next((x for x in (g or {}).get("items", []) if x["id"] == iid), None)
             if it is None or h in it["seen"]:
-                continue  # the same message is never counted twice
+                continue
             prompted = bool(r.get("prompted")) or lex_in(item_text, prev_bot) or (bool(hint) and lex_in(item_text, hint))
             example = str(r.get("example") or "")[:120]
             if prompted:
@@ -1473,7 +1422,6 @@ def new_goal(u: dict, items: list[dict], days: int) -> dict:
                        "p": 0, "days": [], "ex": [], "seen": []} for i, it in enumerate(items)]}
 
 
-# ---- stats text and widget ----
 def build_stats(u: dict) -> dict:
     today = local_today(u)
     stats = u["stats"]
@@ -1587,7 +1535,6 @@ async def send_widget(chat_id: int, html_text: str, caption: str, public_data: s
 
 
 async def tg_call(method: str, **params) -> dict | None:
-    """Raw Bot API call for methods that aiogram may not know yet. Returns the result or None."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=params)
@@ -1602,7 +1549,6 @@ async def tg_call(method: str, **params) -> dict | None:
 
 
 async def use_topic_tabs() -> None:
-    """Shows the topics as tabs above the chat instead of a sidebar (Bot API 10.5, setMySettings)."""
     me = await tg_call("getMe")
     if me is None:
         return
@@ -1613,7 +1559,6 @@ async def use_topic_tabs() -> None:
         log.info("Topics switched to tabs")
 
 
-# ---- hints and reminders ----
 HINT_PROMPT = (
     "You help an English learner who went silent in a chat. Suggest 3 short, natural things they could say "
     "next to continue the conversation. They must fit the last messages, the topic and the level "
@@ -1670,10 +1615,9 @@ async def nudge_one(bot: Bot, u: dict) -> None:
     now_ts = time.time()
     uid = u["user_id"]
     last_user, last_bot = u.get("last_user_ts"), u.get("last_bot_ts")
-    last_main = u.get("last_main_ts") or last_user  # only messages in Main count for Main's hints
+    last_main = u.get("last_main_ts") or last_user
     waiting = bool(last_bot) and (last_main is None or last_main < last_bot)
 
-    # 1) hint when he stops answering in an active conversation, then end the conversation
     if u["active"] and u["hints_on"] and waiting:
         wait = u["hint_min"] * 60
         if not u["hint_sent"] and now_ts - last_bot >= wait:
@@ -1686,7 +1630,6 @@ async def nudge_one(bot: Bot, u: dict) -> None:
             await upd(u, active=False, silence_end=True, hint_sent=False)
             return
 
-    # 2) reminders after a longer silence
     if u["remind_on"] and last_user:
         limit = 1 if u["remind2_h"] == 0 else 2
         sent = u["remind_sent"]
@@ -1701,7 +1644,6 @@ async def nudge_one(bot: Bot, u: dict) -> None:
                 await bot.send_message(uid, html.escape(await gen_nudge(u)), **main_kw(u))
                 return
 
-    # 3) goal reports on the last day of a goal (or later, if the bot was off)
     now_local = local_now(u)
     for g in active_goals(u):
         end = date.fromisoformat(g["end"])
@@ -1718,7 +1660,6 @@ async def nudge_one(bot: Bot, u: dict) -> None:
 
 
 async def friend_hints(bot: Bot, u: dict) -> None:
-    """Silence hint inside a friend's topic: he stopped answering, so send ideas into that topic."""
     if not u["hints_on"]:
         return
     now_ts = time.time()
@@ -1747,7 +1688,7 @@ async def nudge_loop(bot: Bot) -> None:
 
 
 async def mark_user_message(u: dict, friend: dict | None = None) -> None:
-    if friend:  # talking to a friend counts as activity, but must not touch Main's silence hints
+    if friend:
         await upd(u, last_user_ts=time.time(), remind_sent=0)
         await upd_friend(friend, last_user_ts=time.time(), hint_sent=False)
     else:
@@ -1757,7 +1698,7 @@ async def mark_user_message(u: dict, friend: dict | None = None) -> None:
 async def ensure_active(message: Message, u: dict) -> bool:
     if u["active"]:
         return True
-    if u["silence_end"] or u["remind_sent"] > 0:  # he is back after a pause: just continue
+    if u["silence_end"] or u["remind_sent"] > 0:
         await upd(u, active=True, silence_end=False)
         return True
     await say(message, "Send /start to begin 🙂")
@@ -1769,7 +1710,6 @@ async def after_user_message(bot: Bot, u: dict, text: str, result: dict, voice: 
     track(track_goals(u["user_id"], text, prev_bot))
 
 
-# ---- voice replies (text to speech) ----
 def to_ogg_opus(data: bytes, mime: str) -> bytes:
     import subprocess
     try:
@@ -1875,7 +1815,6 @@ async def send_voice_reply(bot: Bot, u: dict, chat_id: int, text: str, friend: d
         return False
 
 
-# ---- keyboards ----
 def level_kb():
     return kb([
         [("A1-A2", "lvl:a"), ("B1-B2", "lvl:b"), ("C1-C2", "lvl:c")],
@@ -1907,7 +1846,7 @@ def time_kb():
 
 
 def settings_kb(u: dict):
-    def tog(label: str, value: bool, data: str):  # green when on, red when off
+    def tog(label: str, value: bool, data: str):
         return (f"{'✅' if value else '❌'} {label}", data, "success" if value else "danger")
 
     style_label = STYLES.get(u["style"], STYLES[DEFAULT_STYLE])[0]
@@ -1929,13 +1868,11 @@ def settings_kb(u: dict):
     ])
 
 
-# ---- handlers ----
-stranger_notice: dict[int, float] = {}  # when a person without access was last told "private bot"
+stranger_notice: dict[int, float] = {}
 STRANGER_PAUSE = 600
 
 
 class AccessMiddleware(BaseMiddleware):
-    """Only the admin and the people the admin allowed can use the bot."""
 
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
@@ -1943,7 +1880,7 @@ class AccessMiddleware(BaseMiddleware):
         if chat is not None and getattr(chat, "type", "private") != "private":
             return None
         if getattr(user, "is_bot", False) or getattr(event, "pinned_message", None) is not None:
-            return None  # service messages are not from a person
+            return None
         if user is None or user.id == ADMIN_ID or user.id in allowed:
             return await handler(event, data)
         now_ts = time.time()
@@ -1951,7 +1888,7 @@ class AccessMiddleware(BaseMiddleware):
         if not told_recently:
             stranger_notice[user.id] = now_ts
         if isinstance(event, Message):
-            if not told_recently:  # no reply to every message, a stranger could make the bot spam
+            if not told_recently:
                 await event.answer("This is a private bot.")
         elif isinstance(event, CallbackQuery):
             await event.answer(None if told_recently else "This is a private bot.", show_alert=not told_recently)
@@ -1959,7 +1896,6 @@ class AccessMiddleware(BaseMiddleware):
 
 
 class TopicMiddleware(BaseMiddleware):
-    """Keeps the topics apart: commands (except /start, /new, /stop, /hint) only work in Commands."""
 
     async def __call__(self, handler, event, data):
         text = getattr(event, "text", None) or ""
@@ -2073,7 +2009,7 @@ async def cmd_start(message: Message):
     if friend:
         await say(message, f"You're chatting with {html.escape(friend['name'])}. Send /new to clear this chat.")
         return
-    await ensure_topics(message.bot, u)  # makes the topics, keeps the conversation
+    await ensure_topics(message.bot, u)
     tid = u["main_thread"] if topics_on(u) else None
     first = ("💬 Continue chatting", "st:cont") if u["history"] else ("Start a conversation", "go")
     text = welcome_text(message.from_user, u)
@@ -2090,12 +2026,12 @@ async def cmd_start(message: Message):
 async def cmd_new(message: Message):
     u = await get_user(message.from_user.id)
     kind, friend = await route(message, u)
-    if friend:  # inside a friend's topic: just clear that conversation
+    if friend:
         await upd_friend(friend, history=[])
         await say(message, "Fresh start 👋")
         return
     await ensure_topics(message.bot, u)
-    if u["active"]:  # a running conversation is never wiped without asking
+    if u["active"]:
         await ask_restart(message)
         return
     await new_conversation(message, u)
@@ -2137,7 +2073,6 @@ async def cb_start_menu(call: CallbackQuery):
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message):
-    """Drops whatever the bot is waiting for: typed answers and half-made goals or friends."""
     u = await get_user(message.from_user.id)
     waiting = bool(u.get("awaiting") or u.get("pending_goal") or u.get("pending_friend"))
     await upd(u, awaiting=None, pending_goal=None, pending_friend=None)
@@ -2147,7 +2082,7 @@ async def cmd_cancel(message: Message):
 @router.message(Command("stop"))
 async def cmd_stop(message: Message):
     u = await get_user(message.from_user.id)
-    if await friend_here(message):  # keep the chats apart: /stop belongs to the main chat only
+    if await friend_here(message):
         await say(message, "Send /new here to clear this chat, or delete the friend in /friends.")
         return
     await reset_chat(u)
@@ -2184,7 +2119,6 @@ async def cmd_streak(message: Message):
     await say(message, text, reply_markup=streak_kb(u["streak"], counted))
 
 
-# ---- admin commands ----
 @router.message(Command("allow"))
 async def cmd_allow(message: Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID:
@@ -2237,16 +2171,15 @@ async def cmd_setstreak(message: Message, command: CommandObject):
         await say(message, "Streak set to 0.")
 
 
-# ---- callbacks ----
 ALREADY_CHATTING = "We're already chatting 🙂"
-starting: set[int] = set()  # people whose conversation is being started right now
+starting: set[int] = set()
 
 
 async def drop_keyboard(call: CallbackQuery) -> None:
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
-        pass  # the message is old or already changed, no problem
+        pass
 
 
 @router.callback_query(F.data == "go")
@@ -2275,7 +2208,6 @@ async def cb_level(call: CallbackQuery):
 
 
 async def begin_chat(message: Message, u: dict) -> bool:
-    """Starts the conversation once: a second tap on an old button must not start another one."""
     uid = u["user_id"]
     if u["active"] or uid in starting:
         return False
@@ -2427,7 +2359,6 @@ async def cb_streak_undo(call: CallbackQuery):
             pass
 
 
-# ---- messages ----
 @router.message(F.voice)
 async def on_voice(message: Message):
     uid = message.from_user.id
@@ -2538,7 +2469,6 @@ async def on_media(message: Message):
     await safe_ai(message, u, note, save_user_text=False, friend=friend)
 
 
-# ---- friends: own characters in their own topics ----
 VOICE_GENDER = {"Kore": "♀", "Puck": "♂", "Charon": "♂", "Aoede": "♀",
                 "en-US-AvaNeural": "♀", "en-US-AndrewNeural": "♂", "en-US-AriaNeural": "♀", "en-US-GuyNeural": "♂"}
 GREET_NOTE = ("[The learner just opened this chat with you. Greet them in character in one or two short "
@@ -2666,7 +2596,7 @@ async def cb_friend_voice(call: CallbackQuery):
         return
     pend["voice"] = f"{provider}:{voice}"
     await upd(u, pending_friend=pend)
-    if provider == "gemini":  # only Gemini voices can have an accent
+    if provider == "gemini":
         await say(call.message, "Should their English have an accent? (voice only)", reply_markup=accent_kb())
     else:
         await finish_friend(call.message, u)
@@ -2696,7 +2626,6 @@ async def cb_friend_retry(call: CallbackQuery):
     await finish_friend(call.message, u)
 
 
-# ---- stage 4 handlers: hints, stats, goals, reminders menu, voice ----
 QUIET_OPTIONS = [("22:00-08:00", "22:00", "08:00"), ("23:00-09:00", "23:00", "09:00"),
                  ("00:00-10:00", "00:00", "10:00"), ("Off", "00:00", "00:00")]
 GOAL_ASK_TEXT = ("Send me what you want to practice: words, expressions, phrasal verbs, grammar, anything. "
@@ -2798,7 +2727,6 @@ async def cb_goal_days(call: CallbackQuery):
         await create_goal(call.message, u, int(value))
 
 
-# ---- reminder timing menu ----
 def reminder_summary(u: dict) -> str:
     second = "off" if u["remind2_h"] == 0 else f"{u['remind2_h']}h"
     quiet = "off" if u["quiet_from"] == u["quiet_to"] else f"{u['quiet_from']}-{u['quiet_to']}"
@@ -2829,7 +2757,6 @@ async def cb_reminder_timing(call: CallbackQuery):
         pass
 
 
-# ---- voice replies ----
 def voice_kb():
     rows = [[(f"Gemini {v}", f"vc:gemini:{v}") for v in GEMINI_VOICES[i:i + 2]] for i in range(0, len(GEMINI_VOICES), 2)]
     rows += [[(v.replace("en-US-", "").replace("Neural", " (Edge)"), f"vc:edge:{v}") for v in EDGE_VOICES[i:i + 2]]
@@ -2875,8 +2802,6 @@ async def cmd_voicetest(message: Message):
     await say(message, "Pick one in /settings → Voice choice.")
 
 
-
-# ---- web server (webhook, health check for the pinger, story page) ----
 STORY_HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -2949,7 +2874,6 @@ document.getElementById("info").textContent = "Telegram " + tg.version + ", " + 
 
 
 def check_init_data(init_data: str) -> int | None:
-    """Checks the signature of the data Telegram gives to a mini app. Returns the user id or None."""
     try:
         pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
         got = pairs.pop("hash", "")
@@ -2987,7 +2911,6 @@ async def story_page(request):
 
 
 async def story_send(request):
-    """Called by the mini app: sends the story file into the user's chat."""
     try:
         body = await request.json()
         n = int(body.get("n", -1))

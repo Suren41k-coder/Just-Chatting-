@@ -1,14 +1,3 @@
-"""
-Renders the "N days in a row" story picture (PNG) or video (MP4).
-
-Put your flame file next to this file (or into an assets/ folder):
-  - animated: flame.apng, flame.webp or flame.gif -> MP4 video
-  - static:   flame.png                            -> PNG picture
-  - nothing:  a simple flame is drawn automatically
-Optional: font.ttf (a bold font) for nicer text.
-
-The cache is automatically refreshed when the flame or font file changes.
-"""
 import logging
 import os
 import re
@@ -56,7 +45,6 @@ def _font(size: int):
 
 
 def _source_signature() -> str:
-    """Signature of the flame and font assets used for rendering."""
     paths = [_find_flame()]
 
     for path in _font_candidates():
@@ -113,7 +101,6 @@ def _gradient() -> Image.Image:
 
 
 def _procedural_flame() -> Image.Image:
-    """A simple flame, used when no flame file is provided."""
     s = 3
     w, h = FLAME_WIDTH * s, int(FLAME_WIDTH * 1.25) * s
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
@@ -156,7 +143,6 @@ def _find_flame():
 
 
 def _load_flame():
-    """Returns (frames, durations_ms). One frame means a static picture."""
     path = _find_flame()
     if not path:
         return [_procedural_flame()], [100]
@@ -309,7 +295,6 @@ def _render_mp4(n: int, frames, durs, out: str) -> bool:
 
 
 def story_path(n: int):
-    """Returns the cached file for this number if it exists."""
     for ext in ("mp4", "png"):
         path = os.path.join(OUT_DIR, f"story_{n}.{ext}")
         if os.path.exists(path):
@@ -317,11 +302,10 @@ def story_path(n: int):
     return None
 
 
-KEEP_FILES = 3  # only the newest story files stay on the disk
+KEEP_FILES = 3
 
 
 def _prune(keep: int = KEEP_FILES) -> None:
-    """Deletes the older story files so the cache cannot grow without limit."""
     try:
         files = [os.path.join(OUT_DIR, f) for f in os.listdir(OUT_DIR) if re.fullmatch(r"story_\d+\.(mp4|png)", f)]
         files.sort(key=os.path.getmtime, reverse=True)
@@ -336,10 +320,6 @@ def _prune(keep: int = KEEP_FILES) -> None:
 
 
 def ensure_story(n: int):
-    """
-    Renders (or finds in the cache) the story for streak n.
-    Returns (path, 'mp4' | 'png').
-    """
     n = max(0, int(n))
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -357,8 +337,6 @@ def ensure_story(n: int):
                 except OSError:
                     pass
 
-        # Remove stale formats too, so an old MP4 cannot be selected
-        # if rendering now falls back to PNG.
         for ext in ("mp4", "png"):
             old_path = os.path.join(OUT_DIR, f"story_{n}.{ext}")
             for path in (old_path, old_path + ".meta"):
