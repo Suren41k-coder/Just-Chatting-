@@ -1,3 +1,6 @@
+import bisect
+import gc
+import itertools
 import logging
 import os
 import re
@@ -5,15 +8,30 @@ import shutil
 import subprocess
 import threading
 
-from PIL import Image, ImageDraw, ImageFont, ImageSequence
+from PIL import Image, ImageDraw, ImageFont
 
 log = logging.getLogger("story")
 
 W, H = 720, 1280
 FPS = 24
 MIN_SECONDS = 3
-FLAME_WIDTH = 560
-FLAME_CENTER_Y = 500
+MAX_CLIP_SECONDS = 8
+LAYOUT_VERSION = "3"
+
+FLAME_WIDTH = 532
+CENTER_X = W / 2
+CENTER_Y = H / 2
+
+NUMBER_SIZES = {1: 416, 2: 352, 3: 272}
+NUMBER_SIZE_DEFAULT = 208
+LABEL_SIZE = 86
+GAP_STICKER_NUMBER = 64
+GAP_NUMBER_LABEL = 52
+MIN_GAP = 28
+BOTTOM_MARGIN = 70
+
+FLAME_NAMES = ("flame.apng", "flame.webp", "flame.webm", "flame.mov", "flame.gif", "flame.png")
+VIDEO_EXT = {".webm", ".mov"}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(HERE, "assets")
@@ -44,6 +62,15 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
+def _find_flame():
+    for name in FLAME_NAMES:
+        for folder in (HERE, ASSETS):
+            path = os.path.join(folder, name)
+            if os.path.exists(path):
+                return path
+    return None
+
+
 def _source_signature() -> str:
     paths = [_find_flame()]
 
@@ -56,7 +83,7 @@ def _source_signature() -> str:
             except Exception:
                 continue
 
-    parts = []
+    parts = [f"layout-{LAYOUT_VERSION}"]
     for path in paths:
         if path and os.path.exists(path):
             stat = os.stat(path)
@@ -133,71 +160,12 @@ def _procedural_flame() -> Image.Image:
     )
 
 
-def _find_flame():
-    for name in ("flame.apng", "flame.webp", "flame.gif", "flame.png"):
-        for folder in (HERE, ASSETS):
-            path = os.path.join(folder, name)
-            if os.path.exists(path):
-                return path
-    return None
-
-
-def _load_flame():
-    path = _find_flame()
-    if not path:
-        return [_procedural_flame()], [100]
-
-    img = Image.open(path)
-    frames, durations = [], []
-
-    for frame in ImageSequence.Iterator(img):
-        current = frame.convert("RGBA").copy()
-        ratio = FLAME_WIDTH / current.width
-        current = current.resize(
-            (FLAME_WIDTH, max(1, int(current.height * ratio))),
-            Image.LANCZOS,
-        )
-        frames.append(current)
-        durations.append(int(frame.info.get("duration") or 40))
-
-    if not frames:
-        return [_procedural_flame()], [100]
-
-    return frames, durations
-
-
-def _text_layer(n: int) -> Image.Image:
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-
-    digits = len(str(n))
-    size = {1: 520, 2: 440, 3: 340}.get(digits, 260)
-    num_font = _font(size)
-
-    cx, cy = W // 2, FLAME_CENTER_Y + 40
-    draw.text(
-        (cx + 6, cy + 10), str(n), font=num_font,
-        fill=(90, 10, 20, 90), anchor="mm",
-    )
-    draw.text(
-        (cx, cy), str(n), font=num_font,
-        fill=(255, 255, 255, 255), anchor="mm",
-    )
-
-    label = "day in a row" if n == 1 else "days in a row"
-    label_font = _font(78)
-    ly = int(H * 0.70)
-
-    draw.text(
-        (cx + 3, ly + 4), label, font=label_font,
-        fill=(90, 10, 20, 90), anchor="mm",
-    )
-    draw.text(
-        (cx, ly), label, font=label_font,
-        fill=(255, 255, 255, 255), anchor="mm",
-    )
-
-    return layer
+def _fit(img: Image.Image) -> Image.Image:
+    img = img.convert("RGBA")
+    if img.width != FLAME_WIDTH:
+        height = max(1, round(img.height * FLAME_WIDTH / img.width))
+        img = img.resize((FLAME_WIDTH, height), Image.LANCZOS)
+    return img
 
 
 def _ffmpeg_exe():
@@ -208,67 +176,217 @@ def _ffmpeg_exe():
         return shutil.which("ffmpeg")
 
 
-def _render_png(n: int, flame: Image.Image, out: str) -> None:
-    canvas = _gradient()
-    pos = (
-        (W - flame.width) // 2,
-        FLAME_CENTER_Y - flame.height // 2,
-    )
-    canvas.paste(flame, pos, flame)
-    text = _text_layer(n)
-    canvas.paste(text, (0, 0), text)
-    canvas.save(out, "PNG", optimize=True)
+def _once(img):
+    yield img
 
 
-def _render_mp4(n: int, frames, durs, out: str) -> bool:
+def _single_frame(path):
+    with Image.open(path) as img:
+        yield _fit(img)
+
+
+def _durations(path) -> list[int]:
+    durs = []
+    with Image.open(path) as img:
+        for i in range(getattr(img, "n_frames", 1)):
+            img.seek(i)
+            durs.append(max(int(img.info.get("duration") or 40), 10))
+    return durs
+
+
+def _pil_frames(path, durs):
+    total = sum(durs)
+    count = max(1, round(total * FPS / 1000))
+    ends = list(itertools.accumulate(durs))
+
+    with Image.open(path) as img:
+        last, current = -1, None
+        for k in range(count):
+            idx = min(bisect.bisect_right(ends, k * 1000 / FPS), len(durs) - 1)
+            if idx != last:
+                img.seek(idx)
+                current = _fit(img)
+                last = idx
+            yield current
+
+
+def _probe_size(exe, path):
+    try:
+        res = subprocess.run(
+            [exe, "-hide_banner", "-i", path],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return None
+    for line in res.stderr.splitlines():
+        if "Video:" in line:
+            m = re.search(r",\s*(\d{2,5})x(\d{2,5})", line)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _video_frames(path):
     exe = _ffmpeg_exe()
     if not exe:
-        return False
+        return
+    size = _probe_size(exe, path)
+    if not size:
+        log.warning("Could not read the size of %s", path)
+        return
 
-    total = max(sum(durs), 1)
-    loops = max(1, round(MIN_SECONDS * 1000 / total))
-    duration = total * loops
-    count = max(1, int(duration / 1000 * FPS))
+    fw = FLAME_WIDTH
+    fh = max(1, round(size[1] * fw / size[0]))
+    need = fw * fh * 4
+    decoders = [["-c:v", "libvpx-vp9"], []] if path.lower().endswith(".webm") else [[]]
 
-    base = _gradient()
-    text = _text_layer(n)
+    for decoder in decoders:
+        cmd = [
+            exe, "-v", "error", "-threads", "2", *decoder,
+            "-i", path, "-t", str(MAX_CLIP_SECONDS),
+            "-vf", f"fps={FPS},scale={fw}:{fh}:flags=lanczos,format=rgba",
+            "-f", "rawvideo", "-pix_fmt", "rgba", "-",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        got = 0
+        try:
+            while True:
+                buf = proc.stdout.read(need)
+                if len(buf) < need:
+                    break
+                got += 1
+                yield Image.frombytes("RGBA", (fw, fh), buf)
+        finally:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        if got:
+            return
 
-    cumulative, acc = [], 0
-    for duration_ms in durs:
-        acc += duration_ms
-        cumulative.append(acc)
 
+def _open_flame():
+    path = _find_flame()
+    if not path:
+        return False, lambda: _once(_procedural_flame())
+
+    if os.path.splitext(path)[1].lower() in VIDEO_EXT:
+        return True, lambda: _video_frames(path)
+
+    try:
+        durs = _durations(path)
+    except Exception:
+        log.exception("Could not read %s, using the drawn flame", path)
+        return False, lambda: _once(_procedural_flame())
+
+    if len(durs) > 1:
+        return True, lambda: _pil_frames(path, durs)
+    return False, lambda: _single_frame(path)
+
+
+def _median(values: bytes) -> float:
+    total = sum(values)
+    if not total:
+        return len(values) / 2
+    acc, half = 0, total / 2
+    for i, v in enumerate(values):
+        if acc + v >= half:
+            return i + (half - acc) / v if v else i
+        acc += v
+    return len(values) / 2
+
+
+def _metrics(img: Image.Image):
+    alpha = img.getchannel("A")
+    box = alpha.point(lambda v: 255 if v > 40 else 0).getbbox()
+    if not box:
+        return img.width / 2, img.height / 2, img.height
+    cols = alpha.resize((img.width, 1), Image.BOX).tobytes()
+    rows = alpha.resize((1, img.height), Image.BOX).tobytes()
+    cx = _median(cols)
+    cy = _median(rows)
+    return cx, cy, box[3]
+
+
+def _ink(draw, text, font):
+    return draw.textbbox((0, 0), text, font=font, anchor="ls")
+
+
+def _draw_centered(draw, text, font, ink, top, shadow):
+    left, ink_top, right, _ = ink
+    x = CENTER_X - (left + right) / 2
+    y = top - ink_top
+    draw.text((x + shadow[0], y + shadow[1]), text, font=font,
+              fill=(90, 10, 20, 90), anchor="ls")
+    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), anchor="ls")
+
+
+def _background(n: int, first: Image.Image):
+    cx, cy, bottom = _metrics(first)
+    pos = (round(CENTER_X - cx), round(CENTER_Y - cy))
+    sticker_bottom = pos[1] + bottom
+
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+
+    number = str(n)
+    label = "day in a row" if n == 1 else "days in a row"
+    label_font = _font(LABEL_SIZE)
+    label_ink = _ink(draw, label, label_font)
+    label_h = label_ink[3] - label_ink[1]
+
+    size = NUMBER_SIZES.get(len(number), NUMBER_SIZE_DEFAULT)
+    while True:
+        number_font = _font(size)
+        number_ink = _ink(draw, number, number_font)
+        number_h = number_ink[3] - number_ink[1]
+        room = (H - BOTTOM_MARGIN) - sticker_bottom - number_h - label_h
+        if room >= MIN_GAP * 2 or size <= 60:
+            break
+        size = int(size * 0.9)
+
+    want = GAP_STICKER_NUMBER + GAP_NUMBER_LABEL
+    if room >= want:
+        gap1, gap2 = GAP_STICKER_NUMBER, GAP_NUMBER_LABEL
+    else:
+        gap1 = max(MIN_GAP, GAP_STICKER_NUMBER * room / want)
+        gap2 = max(MIN_GAP, GAP_NUMBER_LABEL * room / want)
+
+    number_top = sticker_bottom + gap1
+    label_top = number_top + number_h + gap2
+    _draw_centered(draw, number, number_font, number_ink, number_top, (6, 10))
+    _draw_centered(draw, label, label_font, label_ink, label_top, (3, 4))
+
+    bg = _gradient()
+    bg.paste(layer, (0, 0), layer)
+    return bg, pos
+
+
+def _render_png(n: int, flame: Image.Image, out: str) -> None:
+    bg, pos = _background(n, flame)
+    bg.paste(flame, pos, flame)
+    bg.save(out, "PNG", optimize=True)
+
+
+def _encode(exe, frames, bg, pos, out) -> int:
     cmd = [
         exe, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-preset", "veryfast", "-crf", "24",
+        "-preset", "veryfast", "-crf", "24", "-threads", "2",
         "-movflags", "+faststart", "-an", out,
     ]
-
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    canvas = bg.copy()
+    count = 0
 
     try:
-        for i in range(count):
-            t = (i * 1000 / FPS) % total
-            idx = next(
-                (k for k, end in enumerate(cumulative) if t < end),
-                len(frames) - 1,
-            )
-            flame = frames[idx]
-            frame = base.copy()
-            frame.paste(
-                flame,
-                (
-                    (W - flame.width) // 2,
-                    FLAME_CENTER_Y - flame.height // 2,
-                ),
-                flame,
-            )
-            frame.paste(text, (0, 0), text)
-            proc.stdin.write(frame.tobytes())
+        for flame in frames:
+            canvas.paste(bg)
+            canvas.paste(flame, pos, flame)
+            proc.stdin.write(canvas.tobytes())
+            count += 1
 
         proc.stdin.close()
         proc.wait(timeout=300)
@@ -285,13 +403,60 @@ def _render_mp4(n: int, frames, durs, out: str) -> bool:
             proc.wait(timeout=5)
         except Exception:
             pass
+        return 0
+
+    ok = proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0
+    return count if ok else 0
+
+
+def _remove(*paths) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("Could not remove %s", path)
+
+
+def _render_mp4(n: int, make_frames, out: str) -> bool:
+    exe = _ffmpeg_exe()
+    if not exe:
         return False
 
-    return (
-        proc.returncode == 0
-        and os.path.exists(out)
-        and os.path.getsize(out) > 0
-    )
+    gen = make_frames()
+    loop_path = out + ".loop.mp4"
+    try:
+        first = next(gen, None)
+        if first is None:
+            return False
+
+        bg, pos = _background(n, first)
+        count = _encode(exe, itertools.chain([first], gen), bg, pos, loop_path)
+        if not count:
+            return False
+
+        loops = max(1, round(MIN_SECONDS / (count / FPS)))
+        if loops == 1:
+            os.replace(loop_path, out)
+            return True
+
+        res = subprocess.run(
+            [exe, "-y", "-v", "error", "-stream_loop", str(loops - 1),
+             "-i", loop_path, "-c", "copy", "-movflags", "+faststart", out],
+            stderr=subprocess.DEVNULL, timeout=120,
+        )
+        return (
+            res.returncode == 0
+            and os.path.exists(out)
+            and os.path.getsize(out) > 0
+        )
+    except Exception:
+        log.exception("Video rendering failed")
+        return False
+    finally:
+        gen.close()
+        _remove(loop_path)
 
 
 def story_path(n: int):
@@ -310,11 +475,7 @@ def _prune(keep: int = KEEP_FILES) -> None:
         files = [os.path.join(OUT_DIR, f) for f in os.listdir(OUT_DIR) if re.fullmatch(r"story_\d+\.(mp4|png)", f)]
         files.sort(key=os.path.getmtime, reverse=True)
         for path in files[keep:]:
-            for old in (path, path + ".meta"):
-                try:
-                    os.remove(old)
-                except FileNotFoundError:
-                    pass
+            _remove(path, path + ".meta")
     except OSError:
         log.warning("Could not prune the story cache")
 
@@ -339,26 +500,30 @@ def ensure_story(n: int):
 
         for ext in ("mp4", "png"):
             old_path = os.path.join(OUT_DIR, f"story_{n}.{ext}")
-            for path in (old_path, old_path + ".meta"):
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    log.warning("Could not remove stale cache file: %s", path)
+            _remove(old_path, old_path + ".meta")
 
-        frames, durations = _load_flame()
+        try:
+            animated, make_frames = _open_flame()
 
-        if len(frames) > 1:
-            out = os.path.join(OUT_DIR, f"story_{n}.mp4")
-            if _render_mp4(n, frames, durations, out):
-                _write_cache_signature(out, signature)
-                _prune()
-                return out, "mp4"
-            log.warning("Video rendering failed, falling back to a picture")
+            if animated:
+                out = os.path.join(OUT_DIR, f"story_{n}.mp4")
+                if _render_mp4(n, make_frames, out):
+                    _write_cache_signature(out, signature)
+                    _prune()
+                    return out, "mp4"
+                _remove(out)
+                log.warning("Video rendering failed, falling back to a picture")
 
-        out = os.path.join(OUT_DIR, f"story_{n}.png")
-        _render_png(n, frames[0], out)
-        _write_cache_signature(out, signature)
-        _prune()
-        return out, "png"
+            gen = make_frames()
+            try:
+                flame = next(gen, None) or _procedural_flame()
+            finally:
+                gen.close()
+
+            out = os.path.join(OUT_DIR, f"story_{n}.png")
+            _render_png(n, flame, out)
+            _write_cache_signature(out, signature)
+            _prune()
+            return out, "png"
+        finally:
+            gc.collect()

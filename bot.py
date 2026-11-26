@@ -332,6 +332,49 @@ async def topic_alive(bot, chat_id: int, thread_id: int) -> bool:
         return "thread" not in str(e).lower()
 
 
+bot_topics: set[tuple[int, int]] = set()
+stray_seen: dict[tuple[int, int], float] = {}
+stray_notice_at: dict[int, float] = {}
+STRAY_GRACE = 1.0
+STRAY_NOTICE_PAUSE = 20
+STRAY_NOTICE = ("🧹 I removed an extra topic. Everything main happens here: our chat, your streak, hints and "
+                "reminders. Commands live in the Commands topic, and every friend has their own topic.")
+
+
+async def drop_stray(bot, u: dict, tid: int | None, notify: bool = True) -> None:
+    if not tid:
+        return
+    uid = u["user_id"]
+    key = (uid, tid)
+    now = time.time()
+    if key in stray_seen:
+        return
+    if len(stray_seen) > 200:
+        for k in [k for k, t in stray_seen.items() if now - t > 600]:
+            stray_seen.pop(k, None)
+    stray_seen[key] = now
+    await asyncio.sleep(STRAY_GRACE)
+    u = await get_user(uid)
+    if key in bot_topics or tid in (u.get("main_thread"), u.get("cmd_thread")) or await friend_by_thread(uid, tid):
+        stray_seen.pop(key, None)
+        return
+    try:
+        await bot.delete_forum_topic(chat_id=uid, message_thread_id=tid)
+    except Exception:
+        log.warning("could not delete the stray topic %s", tid)
+        try:
+            await bot.send_message(uid, WRONG_TOPIC["other"], message_thread_id=tid)
+        except Exception:
+            pass
+        return
+    if notify and topics_on(u) and now - stray_notice_at.get(uid, 0) > STRAY_NOTICE_PAUSE:
+        stray_notice_at[uid] = now
+        try:
+            await bot.send_message(uid, STRAY_NOTICE, message_thread_id=u["main_thread"])
+        except Exception:
+            log.warning("could not send the stray topic notice")
+
+
 async def ensure_topics(bot, u: dict) -> None:
     for field, name in (("main_thread", "Main"), ("cmd_thread", "Commands")):
         if u.get(field) and not await topic_alive(bot, u["user_id"], u[field]):
@@ -343,6 +386,7 @@ async def ensure_topics(bot, u: dict) -> None:
         except Exception:
             log.warning("could not create the %s topic (are topics on in BotFather?)", name)
             return
+        bot_topics.add((u["user_id"], topic.message_thread_id))
         await upd(u, **{field: topic.message_thread_id})
 
 
@@ -1900,12 +1944,27 @@ class TopicMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         text = getattr(event, "text", None) or ""
         user = getattr(event, "from_user", None)
-        if text.startswith("/") and user and not getattr(user, "is_bot", False):
+        chat = getattr(event, "chat", None)
+        if user and not getattr(user, "is_bot", False) and getattr(chat, "type", "private") == "private":
             u = await get_user(user.id)
             if topics_on(u):
-                name = (text[1:].split() or [""])[0].split("@")[0].lower()
-                kind, _ = await route(event, u)
-                if not (name in ANYWHERE_COMMANDS or kind == "cmd" or (kind in ("main", "friend") and name in CHAT_COMMANDS)):
+                tid = thread_of(event)
+                if not tid or tid == u["main_thread"]:
+                    kind = "main"
+                elif tid == u["cmd_thread"]:
+                    kind = "cmd"
+                else:
+                    kind, _ = await route(event, u)
+                is_cmd = text.startswith("/")
+                name = (text[1:].split() or [""])[0].split("@")[0].lower() if is_cmd else ""
+                if kind == "other":
+                    if is_cmd and name in ANYWHERE_COMMANDS:
+                        result = await handler(event, data)
+                        await drop_stray(event.bot, u, tid, notify=name != "start")
+                        return result
+                    await drop_stray(event.bot, u, tid)
+                    return None
+                if is_cmd and not (name in ANYWHERE_COMMANDS or kind == "cmd" or (kind in ("main", "friend") and name in CHAT_COMMANDS)):
                     await say(event, "Commands live in the Commands topic, open it in the sidebar 👉")
                     return None
         return await handler(event, data)
@@ -2531,6 +2590,7 @@ async def finish_friend(message, u: dict) -> None:
                            "topics for private chats, then tap the button.",
                   reply_markup=kb([[("Try again", "fc:go")]]))
         return
+    bot_topics.add((u["user_id"], topic.message_thread_id))
     friend = await add_friend(u["user_id"], pend["name"], pend["about"], pend["voice"],
                               pend.get("accent"), topic.message_thread_id)
     await upd(u, pending_friend=None, awaiting=None)

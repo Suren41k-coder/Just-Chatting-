@@ -297,6 +297,33 @@ async def main():
     assert await tryit("/start", 4242) and await tryit("/start", main) and await tryit("/start", None)
     assert not await tryit("/settings", 4242) and not await tryit("/create", main)
     assert await tryit("/settings@Just_Bot", cmd) and not await tryit("/settings@Just_Bot", main)
+
+    bot.STRAY_GRACE = 0; bot.stray_seen.clear(); bot.stray_notice_at.clear(); B.deleted.clear()
+    assert not await tryit("hello from All", 5555)
+    assert B.deleted == [5555] and B.sent[-1][1] == {"message_thread_id": main} and "extra topic" in B.sent[-1][0]
+    B.deleted.clear()
+    assert not await tryit("again", 5555) and B.deleted == [] and B.sent == []
+    svc = Msg("", thread=5556); svc.forum_topic_created = object()
+    ran.clear(); clear(); await mw(h, svc, {})
+    assert not ran and B.deleted == [5556] and B.sent == [], "service message: topic removed, notice is rate limited"
+    for th in (main, cmd, 888):
+        assert await tryit("hello", th)
+    assert B.deleted == [5556]
+    bot.bot_topics.add((1, 5557)); B.deleted.clear()
+    assert not await tryit("x", 5557) and B.deleted == [], "topics made by the bot itself are protected"
+    bot.stray_notice_at.clear()
+    assert await tryit("/start", 5558) and B.deleted == [5558] and B.sent == []
+    assert await tryit("/cancel", 5559) and B.deleted == [5558, 5559] and "extra topic" in texts()[-1]
+    real_delete = B.delete_forum_topic
+    async def bad_delete(chat_id, message_thread_id): raise RuntimeError("no rights")
+    B.delete_forum_topic = bad_delete
+    assert not await tryit("hey", 5560) and B.sent[-1][1] == {"message_thread_id": 5560}
+    B.delete_forum_topic = real_delete
+    own = Msg("", thread=5561); own.forum_topic_created = object(); own.from_user.is_bot = True
+    B.deleted.clear(); ran.clear(); await mw(h, own, {})
+    assert ran and B.deleted == [], "the bot's own service messages are ignored"
+    assert any(k[0] == 1 for k in bot.bot_topics)
+    print("stray topics are deleted, Main gets a notice OK")
     await bot.upd(u, main_thread=None, cmd_thread=None)
     assert await tryit("/settings", 4242) and await tryit("/settings", None)
     await bot.upd(u, main_thread=main, cmd_thread=cmd)
@@ -480,6 +507,36 @@ async def main():
     assert left == ["keep.txt", "story_4.mp4", "story_4.mp4.meta", "story_5.mp4", "story_5.mp4.meta",
                     "story_6.mp4", "story_6.mp4.meta"], left
     print("story cache prune OK")
+
+    from PIL import Image as _Img
+    flame = _story._procedural_flame()
+    bg, pos = _story._background(284, flame)
+    cx, cy, bottom = _story._metrics(flame)
+    assert abs(pos[0] + cx - _story.W / 2) <= 1 and abs(pos[1] + cy - _story.H / 2) <= 1
+    assert _story.FLAME_WIDTH == 532
+    px = bg.load()
+    bands, cur = [], None
+    for y in range(_story.H):
+        xs = [x for x in range(0, _story.W, 2) if min(px[x, y]) >= 250]
+        if xs and cur is None: cur = [y, y, min(xs), max(xs)]
+        elif xs: cur[1] = y; cur[2] = min(cur[2], min(xs)); cur[3] = max(cur[3], max(xs))
+        elif cur is not None and y - cur[1] > 12: bands.append(cur); cur = None
+    if cur: bands.append(cur)
+    assert len(bands) == 2, bands
+    (n_top, n_bot, n_l, n_r), (l_top, l_bot, l_l, l_r) = bands
+    assert abs((n_l + n_r) / 2 - _story.W / 2) <= 4 and abs((l_l + l_r) / 2 - _story.W / 2) <= 4, bands
+    sticker_bottom = pos[1] + bottom
+    assert n_top - sticker_bottom >= _story.MIN_GAP - 2 and l_top - n_bot >= _story.MIN_GAP - 2, (sticker_bottom, bands)
+    assert l_bot <= _story.H - _story.BOTTOM_MARGIN + 4, bands
+    assert _story._fit(_Img.new("RGBA", (1000, 500))).size == (532, 266)
+    apng = _os.path.join(tmp, "t.apng"); fr = [_Img.new("RGBA", (40, 40), (i * 60, 0, 0, 255)) for i in range(3)]
+    fr[0].save(apng, save_all=True, append_images=fr[1:], duration=[40, 40, 80], loop=0)
+    assert _story._durations(apng) == [40, 40, 80]
+    got = list(_story._pil_frames(apng, [40, 40, 80]))
+    assert len(got) == 4 and got[0] is not got[1] and got[2] is got[3]
+    _story.OUT_DIR = tmp; out, kind = _story.ensure_story(7)
+    assert kind == "png" and _Img.open(out).size == (720, 1280)
+    print("story layout + frames OK")
 
     ex = []
     class Conn:
