@@ -1829,8 +1829,20 @@ async def tts_edge(text: str, voice: str) -> tuple[bytes, str]:
     return audio, "audio/mpeg"
 
 
+SPOKEN_ABBR = {
+    "TBH": "to be honest", "TBF": "to be fair", "IMO": "in my opinion", "IMHO": "in my humble opinion",
+    "BTW": "by the way", "IDK": "I don't know", "FYI": "for your information", "OMG": "oh my god",
+    "ASAP": "as soon as possible", "AFAIK": "as far as I know", "FWIW": "for what it's worth",
+    "NGL": "not gonna lie", "IIRC": "if I recall correctly", "BRB": "be right back",
+    "SMH": "shaking my head", "ICYMI": "in case you missed it", "LOL": "ha ha", "LMAO": "ha ha",
+    "TBC": "to be continued", "FOMO": "fear of missing out", "DIY": "do it yourself",
+}
+ABBR_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, SPOKEN_ABBR), key=len, reverse=True)) + r")\b", re.I)
+
+
 def clean_for_speech(text: str) -> str:
     text = re.sub(r"<[^>]+>", "", text)
+    text = ABBR_RE.sub(lambda m: SPOKEN_ABBR[m.group(1).upper()], text)
     text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text)
     return " ".join(text.split())[:700]
 

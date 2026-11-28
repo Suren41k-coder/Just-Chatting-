@@ -17,6 +17,9 @@ sys.modules["aiogram"].BaseMiddleware = _Base
 sys.modules["aiogram"].Router = _Router
 import bot
 bot.TOPIC_PROBE_PAUSE = 0
+assert bot.clean_for_speech("TBH, imo it's fine. <b>BTW</b> lol 😂 ASAP") == "to be honest, in my opinion it's fine. by the way ha ha as soon as possible"
+assert bot.clean_for_speech("Tbhx and DIYs stay") == "Tbhx and DIYs stay"
+print("spoken abbreviations OK")
 real_kb = bot.kb
 bot.kb = lambda rows: rows
 bot.HTTPStatusError = Exception
@@ -544,6 +547,30 @@ async def main():
     assert abs((n_top - sticker_bottom) - _story.GAP_STICKER_NUMBER) <= 6, (sticker_bottom, bands)
     assert abs((l_top - n_bot) - _story.GAP_NUMBER_LABEL) <= 6, bands
     assert _story._sprite("7", 138, 190).width <= 138 and _story._sprite("5", 138, 190).height <= 190
+    assert not any(g > 200 and r < 60 and b < 60 for r, g, b in (bg.getpixel((x, y)) for x in range(0, 720, 8) for y in range(100, 330, 8)))
+    logo_path = _os.path.join(tmp, "logo.png"); _Img.new("RGBA", (600, 200), (0, 255, 0, 255)).save(logo_path)
+    real_find, sig_before = _story._find_logo, _story._source_signature()
+    _story._find_logo = lambda: logo_path
+    assert "logo:" in _story._source_signature() and _story._source_signature() != sig_before
+    def green(img):
+        pw = img.load()
+        ys = [y for y in range(_story.H) if any(pw[x, y][1] > 200 and pw[x, y][0] < 60 for x in range(0, _story.W, 4))]
+        xs = [x for x in range(_story.W) if any(pw[x, y][1] > 200 and pw[x, y][0] < 60 for y in range(0, _story.H, 4))]
+        return min(xs), max(xs), min(ys), max(ys)
+    from PIL import ImageDraw as _Draw
+    coin = _Img.new("RGBA", (300, 300), (0, 0, 0, 0)); _Draw.Draw(coin).ellipse((35, 35, 265, 265), fill=(240, 170, 20, 255))
+    bg2, pos2 = _story._background(284, coin)
+    cx2, top2, bottom2 = _story._metrics(coin)
+    x0, x1, y0, y1 = green(bg2)
+    assert abs((x0 + x1) / 2 - _story.W / 2) <= 3 and abs((x1 - x0) - 340) <= 4, (x0, x1)
+    assert abs((y0 + y1) / 2 - _story.H * 0.205) <= 4 and y1 <= pos2[1] + top2 - _story.LOGO_MIN_GAP, (y0, y1, pos2)
+    _, pos3 = _story._background(284, coin)
+    _story._find_logo = lambda: None
+    assert _story._background(284, coin)[1] == pos3, "the logo does not move the group"
+    _story._find_logo = lambda: logo_path
+    _, _, ty0, ty1 = green(_story._background(284, flame)[0])
+    assert ty1 <= pos[1] + box_top - _story.LOGO_MIN_GAP + 1, "a tall sticker pushes the logo up instead of overlapping"
+    _story._find_logo = real_find
     assert _story._fit(_Img.new("RGBA", (1000, 500))).size == (300, 150)
     apng = _os.path.join(tmp, "t.apng"); fr = [_Img.new("RGBA", (40, 40), (i * 60, 0, 0, 255)) for i in range(3)]
     fr[0].save(apng, save_all=True, append_images=fr[1:], duration=[40, 40, 80], loop=0)

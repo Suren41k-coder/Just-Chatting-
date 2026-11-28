@@ -16,7 +16,7 @@ W, H = 720, 1280
 FPS = 24
 MIN_SECONDS = 3
 MAX_CLIP_SECONDS = 8
-LAYOUT_VERSION = "4"
+LAYOUT_VERSION = "5"
 
 FLAME_WIDTH = 300
 GROUP_CENTER_Y = H * 0.5
@@ -33,6 +33,12 @@ GAP_STICKER_NUMBER = 60
 GAP_NUMBER_LABEL = 40
 TEXT_RENDER_SIZE = 360
 EDGE_MARGIN = 60
+
+LOGO_NAME = "logo.png"
+LOGO_WIDTH = 340
+LOGO_MAX_H = 160
+LOGO_CENTER_Y = H * 0.205
+LOGO_MIN_GAP = 40
 
 FLAME_NAMES = ("flame.apng", "flame.webp", "flame.webm", "flame.mov", "flame.gif", "flame.png")
 VIDEO_EXT = {".webm", ".mov"}
@@ -75,6 +81,29 @@ def _find_flame():
     return None
 
 
+def _find_logo():
+    for folder in (HERE, ASSETS):
+        path = os.path.join(folder, LOGO_NAME)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _logo_image():
+    path = _find_logo()
+    if not path:
+        return None
+    try:
+        with Image.open(path) as img:
+            img = img.convert("RGBA")
+            scale = min(LOGO_WIDTH / img.width, LOGO_MAX_H / img.height)
+            size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+            return img.resize(size, Image.LANCZOS)
+    except Exception:
+        log.exception("Could not read %s, rendering without a logo", path)
+        return None
+
+
 def _source_signature() -> str:
     paths = [_find_flame()]
 
@@ -96,6 +125,11 @@ def _source_signature() -> str:
             )
         else:
             parts.append("procedural-flame" if not path else str(path))
+
+    logo = _find_logo()
+    if logo:
+        stat = os.stat(logo)
+        parts.append(f"logo:{os.path.abspath(logo)}:{stat.st_mtime_ns}:{stat.st_size}")
 
     return "|".join(parts)
 
@@ -358,6 +392,13 @@ def _background(n: int, first: Image.Image):
 
     bg = _gradient()
     bg.paste(layer, (0, 0), layer)
+
+    logo = _logo_image()
+    if logo is not None:
+        logo_top = round(LOGO_CENTER_Y - logo.height / 2)
+        logo_top = min(logo_top, top - LOGO_MIN_GAP - logo.height)
+        logo_top = max(logo_top, 0)
+        bg.paste(logo, (round(CENTER_X - logo.width / 2), logo_top), logo)
     return bg, pos
 
 
