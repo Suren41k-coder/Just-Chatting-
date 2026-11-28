@@ -324,12 +324,22 @@ ANYWHERE_COMMANDS = {"start", "cancel"}
 CANCEL_HINT = "\n/cancel to stop"
 
 
+TOPIC_PROBE_PAUSE = 1.0
+TOPIC_PROBES = 3
+
+
 async def topic_alive(bot, chat_id: int, thread_id: int) -> bool:
-    try:
-        await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
-        return True
-    except Exception as e:
-        return "thread" not in str(e).lower()
+    for attempt in range(TOPIC_PROBES):
+        try:
+            await bot.send_chat_action(chat_id, "typing", message_thread_id=thread_id)
+            return True
+        except Exception as e:
+            if "thread" not in str(e).lower():
+                return True
+            log.warning("topic %s probe %s/%s failed: %s", thread_id, attempt + 1, TOPIC_PROBES, e)
+            if attempt + 1 < TOPIC_PROBES:
+                await asyncio.sleep(TOPIC_PROBE_PAUSE)
+    return False
 
 
 bot_topics: set[tuple[int, int]] = set()
@@ -353,6 +363,7 @@ async def drop_stray(bot, u: dict, tid: int | None, notify: bool = True) -> None
         for k in [k for k, t in stray_seen.items() if now - t > 600]:
             stray_seen.pop(k, None)
     stray_seen[key] = now
+    log.info("extra topic %s from %s, checking", tid, uid)
     await asyncio.sleep(STRAY_GRACE)
     u = await get_user(uid)
     if key in bot_topics or tid in (u.get("main_thread"), u.get("cmd_thread")) or await friend_by_thread(uid, tid):
@@ -360,13 +371,14 @@ async def drop_stray(bot, u: dict, tid: int | None, notify: bool = True) -> None
         return
     try:
         await bot.delete_forum_topic(chat_id=uid, message_thread_id=tid)
-    except Exception:
-        log.warning("could not delete the stray topic %s", tid)
+    except Exception as e:
+        log.warning("could not delete the stray topic %s: %s", tid, e)
         try:
             await bot.send_message(uid, WRONG_TOPIC["other"], message_thread_id=tid)
         except Exception:
             pass
         return
+    log.info("deleted the extra topic %s", tid)
     if notify and topics_on(u) and now - stray_notice_at.get(uid, 0) > STRAY_NOTICE_PAUSE:
         stray_notice_at[uid] = now
         try:
@@ -378,6 +390,7 @@ async def drop_stray(bot, u: dict, tid: int | None, notify: bool = True) -> None
 async def ensure_topics(bot, u: dict) -> None:
     for field, name in (("main_thread", "Main"), ("cmd_thread", "Commands")):
         if u.get(field) and not await topic_alive(bot, u["user_id"], u[field]):
+            log.warning("%s topic %s is gone for %s, creating a new one", name, u[field], u["user_id"])
             await upd(u, **{field: None})
         if u.get(field):
             continue
@@ -388,6 +401,7 @@ async def ensure_topics(bot, u: dict) -> None:
             return
         bot_topics.add((u["user_id"], topic.message_thread_id))
         await upd(u, **{field: topic.message_thread_id})
+        log.info("created the %s topic %s for %s", name, topic.message_thread_id, u["user_id"])
 
 
 async def add_friend(uid: int, name: str, about: str, voice: str, accent: str | None, thread_id: int) -> dict:
@@ -1923,6 +1937,10 @@ class AccessMiddleware(BaseMiddleware):
         chat = getattr(event, "chat", None) or getattr(getattr(event, "message", None), "chat", None)
         if chat is not None and getattr(chat, "type", "private") != "private":
             return None
+        if getattr(event, "forum_topic_created", None) is not None and chat is not None:
+            if chat.id == ADMIN_ID or chat.id in allowed:
+                return await handler(event, data)
+            return None
         if getattr(user, "is_bot", False) or getattr(event, "pinned_message", None) is not None:
             return None
         if user is None or user.id == ADMIN_ID or user.id in allowed:
@@ -1945,6 +1963,11 @@ class TopicMiddleware(BaseMiddleware):
         text = getattr(event, "text", None) or ""
         user = getattr(event, "from_user", None)
         chat = getattr(event, "chat", None)
+        if getattr(event, "forum_topic_created", None) is not None and getattr(chat, "type", "private") == "private":
+            u = await get_user(chat.id)
+            if topics_on(u):
+                await drop_stray(event.bot, u, thread_of(event) or getattr(event, "message_id", None))
+            return None
         if user and not getattr(user, "is_bot", False) and getattr(chat, "type", "private") == "private":
             u = await get_user(user.id)
             if topics_on(u):

@@ -16,19 +16,23 @@ W, H = 720, 1280
 FPS = 24
 MIN_SECONDS = 3
 MAX_CLIP_SECONDS = 8
-LAYOUT_VERSION = "3"
+LAYOUT_VERSION = "4"
 
-FLAME_WIDTH = 532
+FLAME_WIDTH = 300
+GROUP_CENTER_Y = H * 0.5
 CENTER_X = W / 2
-CENTER_Y = H / 2
 
-NUMBER_SIZES = {1: 416, 2: 352, 3: 272}
-NUMBER_SIZE_DEFAULT = 208
-LABEL_SIZE = 86
-GAP_STICKER_NUMBER = 64
-GAP_NUMBER_LABEL = 52
-MIN_GAP = 28
-BOTTOM_MARGIN = 70
+NUMBER_PER_DIGIT = 128
+NUMBER_MAX_W = 400
+NUMBER_MAX_H = 190
+LABEL_RATIO = 0.85
+LABEL_MIN_W = 260
+LABEL_MAX_W = 380
+LABEL_MAX_H = 60
+GAP_STICKER_NUMBER = 60
+GAP_NUMBER_LABEL = 40
+TEXT_RENDER_SIZE = 360
+EDGE_MARGIN = 60
 
 FLAME_NAMES = ("flame.apng", "flame.webp", "flame.webm", "flame.mov", "flame.gif", "flame.png")
 VIDEO_EXT = {".webm", ".mov"}
@@ -301,62 +305,56 @@ def _metrics(img: Image.Image):
     alpha = img.getchannel("A")
     box = alpha.point(lambda v: 255 if v > 40 else 0).getbbox()
     if not box:
-        return img.width / 2, img.height / 2, img.height
+        return img.width / 2, 0, img.height
     cols = alpha.resize((img.width, 1), Image.BOX).tobytes()
-    rows = alpha.resize((1, img.height), Image.BOX).tobytes()
-    cx = _median(cols)
-    cy = _median(rows)
-    return cx, cy, box[3]
+    return _median(cols), box[1], box[3]
 
 
-def _ink(draw, text, font):
-    return draw.textbbox((0, 0), text, font=font, anchor="ls")
+def _sprite(text: str, target_w: int, max_h: int) -> Image.Image:
+    font = _font(TEXT_RENDER_SIZE)
+    box = font.getbbox(text, anchor="ls")
+    pad = 6
+    mask = Image.new("L", (box[2] - box[0] + pad * 2, box[3] - box[1] + pad * 2), 0)
+    ImageDraw.Draw(mask).text((pad - box[0], pad - box[1]), text, font=font, fill=255, anchor="ls")
+    ink = mask.getbbox()
+    if ink:
+        mask = mask.crop(ink)
+    scale = target_w / mask.width
+    if mask.height * scale > max_h:
+        scale = max_h / mask.height
+    size = (max(1, round(mask.width * scale)), max(1, round(mask.height * scale)))
+    return mask.resize(size, Image.LANCZOS)
 
 
-def _draw_centered(draw, text, font, ink, top, shadow):
-    left, ink_top, right, _ = ink
-    x = CENTER_X - (left + right) / 2
-    y = top - ink_top
-    draw.text((x + shadow[0], y + shadow[1]), text, font=font,
-              fill=(90, 10, 20, 90), anchor="ls")
-    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), anchor="ls")
+def _paste_text(layer: Image.Image, mask: Image.Image, top: int) -> None:
+    x = round(CENTER_X - mask.width / 2)
+    shift = max(2, round(mask.height * 0.05))
+    layer.paste((90, 10, 20, 90), (x + shift // 2, top + shift), mask)
+    layer.paste((255, 255, 255, 255), (x, top), mask)
 
 
 def _background(n: int, first: Image.Image):
-    cx, cy, bottom = _metrics(first)
-    pos = (round(CENTER_X - cx), round(CENTER_Y - cy))
-    sticker_bottom = pos[1] + bottom
-
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
+    cx, box_top, box_bottom = _metrics(first)
+    sticker_h = box_bottom - box_top
 
     number = str(n)
     label = "day in a row" if n == 1 else "days in a row"
-    label_font = _font(LABEL_SIZE)
-    label_ink = _ink(draw, label, label_font)
-    label_h = label_ink[3] - label_ink[1]
+    number_w = min(NUMBER_MAX_W, NUMBER_PER_DIGIT * len(number) + 10)
+    number_img = _sprite(number, number_w, NUMBER_MAX_H)
+    label_w = round(min(LABEL_MAX_W, max(LABEL_MIN_W, number_img.width * LABEL_RATIO)))
+    label_img = _sprite(label, label_w, LABEL_MAX_H)
 
-    size = NUMBER_SIZES.get(len(number), NUMBER_SIZE_DEFAULT)
-    while True:
-        number_font = _font(size)
-        number_ink = _ink(draw, number, number_font)
-        number_h = number_ink[3] - number_ink[1]
-        room = (H - BOTTOM_MARGIN) - sticker_bottom - number_h - label_h
-        if room >= MIN_GAP * 2 or size <= 60:
-            break
-        size = int(size * 0.9)
+    total = (sticker_h + GAP_STICKER_NUMBER + number_img.height
+             + GAP_NUMBER_LABEL + label_img.height)
+    top = max(EDGE_MARGIN, round(GROUP_CENTER_Y - total / 2))
 
-    want = GAP_STICKER_NUMBER + GAP_NUMBER_LABEL
-    if room >= want:
-        gap1, gap2 = GAP_STICKER_NUMBER, GAP_NUMBER_LABEL
-    else:
-        gap1 = max(MIN_GAP, GAP_STICKER_NUMBER * room / want)
-        gap2 = max(MIN_GAP, GAP_NUMBER_LABEL * room / want)
+    pos = (round(CENTER_X - cx), top - box_top)
+    number_top = top + sticker_h + GAP_STICKER_NUMBER
+    label_top = number_top + number_img.height + GAP_NUMBER_LABEL
 
-    number_top = sticker_bottom + gap1
-    label_top = number_top + number_h + gap2
-    _draw_centered(draw, number, number_font, number_ink, number_top, (6, 10))
-    _draw_centered(draw, label, label_font, label_ink, label_top, (3, 4))
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    _paste_text(layer, number_img, number_top)
+    _paste_text(layer, label_img, label_top)
 
     bg = _gradient()
     bg.paste(layer, (0, 0), layer)

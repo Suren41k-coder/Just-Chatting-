@@ -16,6 +16,7 @@ for name in ["asyncpg","httpx","aiohttp","aiohttp.web","aiogram","aiogram.client
 sys.modules["aiogram"].BaseMiddleware = _Base
 sys.modules["aiogram"].Router = _Router
 import bot
+bot.TOPIC_PROBE_PAUSE = 0
 real_kb = bot.kb
 bot.kb = lambda rows: rows
 bot.HTTPStatusError = Exception
@@ -23,12 +24,13 @@ bot.HTTPStatusError = Exception
 class FakeBot:
     def __init__(s):
         s.sent, s.voices, s.actions, s.topics, s.deleted = [], [], [], [], []
-        s.topic_fail = False; s.tid = 776; s.dead = set(); s.chat_fail = None
+        s.topic_fail = False; s.tid = 776; s.dead = set(); s.chat_fail = None; s.flaky = 0
     async def send_message(s, chat_id, text, **kw):
         s.sent.append((text, kw)); return types.SimpleNamespace(message_id=5)
     async def send_voice(s, chat_id, f, **kw): s.voices.append(kw)
     async def send_chat_action(s, chat_id, action, **kw):
         if s.chat_fail: raise RuntimeError(s.chat_fail)
+        if s.flaky > 0: s.flaky -= 1; raise RuntimeError("Bad Request: message thread not found")
         if kw.get("message_thread_id") in s.dead: raise RuntimeError("Bad Request: message thread not found")
         s.actions.append((action, kw))
     async def pin_chat_message(s, *a, **k): pass
@@ -319,9 +321,13 @@ async def main():
     B.delete_forum_topic = bad_delete
     assert not await tryit("hey", 5560) and B.sent[-1][1] == {"message_thread_id": 5560}
     B.delete_forum_topic = real_delete
-    own = Msg("", thread=5561); own.forum_topic_created = object(); own.from_user.is_bot = True
+    bot.bot_topics.add((1, 5561)); own = Msg("", thread=5561); own.forum_topic_created = object()
     B.deleted.clear(); ran.clear(); await mw(h, own, {})
-    assert ran and B.deleted == [], "the bot's own service messages are ignored"
+    assert not ran and B.deleted == [], "service message of a topic made by the bot is ignored"
+    svc2 = Msg("", thread=5562); svc2.forum_topic_created = object(); svc2.from_user.is_bot = True
+    async def chain(e, d): return await mw(h, e, d)
+    B.deleted.clear(); ran.clear(); await bot.AccessMiddleware()(chain, svc2, {})
+    assert not ran and B.deleted == [5562], "service message sent as the bot account still reaches the cleanup"
     assert any(k[0] == 1 for k in bot.bot_topics)
     print("stray topics are deleted, Main gets a notice OK")
     await bot.upd(u, main_thread=None, cmd_thread=None)
@@ -347,6 +353,14 @@ async def main():
     assert B.topics == [] and u["main_thread"] == main
     B.chat_fail = None
     print("topic self-heal OK")
+    B.topics.clear(); B.flaky = 2; clear()
+    await bot.cmd_start(Msg("/start", thread=cmd))
+    assert B.topics == [] and u["main_thread"] == main, "two failed probes do not recreate the topic"
+    B.flaky = 3; clear()
+    await bot.cmd_start(Msg("/start", thread=cmd))
+    assert B.topics == ["Main"] and u["main_thread"] != main
+    main = u["main_thread"]
+    print("topic probe is patient OK")
 
     await bot.upd(u, main_thread=None, cmd_thread=None); B.topic_fail = True; clear()
     await bot.cmd_start(Msg("/start"))
@@ -511,9 +525,8 @@ async def main():
     from PIL import Image as _Img
     flame = _story._procedural_flame()
     bg, pos = _story._background(284, flame)
-    cx, cy, bottom = _story._metrics(flame)
-    assert abs(pos[0] + cx - _story.W / 2) <= 1 and abs(pos[1] + cy - _story.H / 2) <= 1
-    assert _story.FLAME_WIDTH == 532
+    cx, box_top, box_bottom = _story._metrics(flame)
+    assert _story.FLAME_WIDTH == 300 and abs(pos[0] + cx - _story.W / 2) <= 1
     px = bg.load()
     bands, cur = [], None
     for y in range(_story.H):
@@ -525,10 +538,13 @@ async def main():
     assert len(bands) == 2, bands
     (n_top, n_bot, n_l, n_r), (l_top, l_bot, l_l, l_r) = bands
     assert abs((n_l + n_r) / 2 - _story.W / 2) <= 4 and abs((l_l + l_r) / 2 - _story.W / 2) <= 4, bands
-    sticker_bottom = pos[1] + bottom
-    assert n_top - sticker_bottom >= _story.MIN_GAP - 2 and l_top - n_bot >= _story.MIN_GAP - 2, (sticker_bottom, bands)
-    assert l_bot <= _story.H - _story.BOTTOM_MARGIN + 4, bands
-    assert _story._fit(_Img.new("RGBA", (1000, 500))).size == (532, 266)
+    assert abs((n_r - n_l) - 394) <= 8 and abs((l_r - l_l) - 335) <= 8, bands
+    sticker_top, sticker_bottom = pos[1] + box_top, pos[1] + box_bottom
+    assert abs((sticker_top + l_bot) / 2 - _story.H / 2) <= 8, (sticker_top, bands)
+    assert abs((n_top - sticker_bottom) - _story.GAP_STICKER_NUMBER) <= 6, (sticker_bottom, bands)
+    assert abs((l_top - n_bot) - _story.GAP_NUMBER_LABEL) <= 6, bands
+    assert _story._sprite("7", 138, 190).width <= 138 and _story._sprite("5", 138, 190).height <= 190
+    assert _story._fit(_Img.new("RGBA", (1000, 500))).size == (300, 150)
     apng = _os.path.join(tmp, "t.apng"); fr = [_Img.new("RGBA", (40, 40), (i * 60, 0, 0, 255)) for i in range(3)]
     fr[0].save(apng, save_all=True, append_images=fr[1:], duration=[40, 40, 80], loop=0)
     assert _story._durations(apng) == [40, 40, 80]
